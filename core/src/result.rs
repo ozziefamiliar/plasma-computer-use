@@ -25,6 +25,9 @@ pub enum ExecError {
     /// Backend-specific failure that is neither mapping nor known-transient
     /// (e.g. unresolvable key name). Returned to the model.
     Backend(String),
+    /// Safety-guard denial or unconfirmed destructive action. Never retried;
+    /// the reason is model-facing so the model can adjust.
+    Guard(String),
 }
 
 impl ExecError {
@@ -40,6 +43,7 @@ impl std::fmt::Display for ExecError {
             ExecError::Map(e) => write!(f, "{}", e),
             ExecError::Infra(e) => write!(f, "infrastructure failure: {}", e),
             ExecError::Backend(e) => write!(f, "backend failure: {}", e),
+            ExecError::Guard(e) => write!(f, "safety guard: {}", e),
         }
     }
 }

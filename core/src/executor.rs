@@ -111,6 +111,8 @@ pub struct Executor<C, I, W, K> {
     /// debug log) also needs the pixels the model must see. Real backends
     /// produce real bytes; the core treats them as opaque.
     screenshot_bytes: VecDeque<(FrameId, Vec<u8>)>,
+    /// Safety policy applied to every batch before execution.
+    policy: crate::guard::Policy,
 }
 
 impl<C, I, W, K> Executor<C, I, W, K>
@@ -137,7 +139,13 @@ where
             registry: FrameRegistry::new(),
             geometry,
             screenshot_bytes: VecDeque::new(),
+            policy: crate::guard::Policy::default(),
         }
+    }
+
+    /// Replace the safety policy (hosts load it from config).
+    pub fn set_policy(&mut self, policy: crate::guard::Policy) {
+        self.policy = policy;
     }
 
     /// The full self-describing payload for a frame (MCP adapter's view).
@@ -175,13 +183,30 @@ where
     }
 
     /// Execute a batch; outcomes are parallel to the input actions.
+    /// The safety policy is reviewed first: denied or unconfirmed actions
+    /// fail in place without aborting the batch.
     pub fn execute(&mut self, batch: &Batch) -> BatchResult {
+        let verdicts = crate::guard::review_batch(&self.policy, batch);
         let mut result = BatchResult::new();
-        for action in &batch.0 {
-            let (outcome, new_frame) = self.execute_one(action);
-            if let Some(id) = new_frame {
-                result.new_frames.push(id);
-            }
+        for (action, verdict) in batch.0.iter().zip(verdicts) {
+            let outcome = match verdict {
+                crate::guard::Verdict::Allow => {
+                    let (outcome, new_frame) = self.execute_one(action);
+                    if let Some(id) = new_frame {
+                        result.new_frames.push(id);
+                    }
+                    outcome
+                }
+                crate::guard::Verdict::Deny { reason } => ActionOutcome::Failed {
+                    error: ExecError::Guard(reason),
+                },
+                crate::guard::Verdict::NeedsConfirm { reason } => ActionOutcome::Failed {
+                    // No confirmation channel exists yet; hosts add one by
+                    // pre-confirming through their own UX and calling
+                    // set_policy with an emptied confirm list.
+                    error: ExecError::Guard(format!("confirmation required: {}", reason)),
+                },
+            };
             result.outcomes.push(outcome);
         }
         result
@@ -428,6 +453,7 @@ fn interpolate(path: &[UInputAbs], total: u32) -> Vec<UInputAbs> {
 mod tests {
     use super::*;
     use crate::backend::{MockCapture, MockInput, MockWindow, InputOp};
+    use crate::guard::Policy;
 
     fn identity_space() -> CoordSpace {
         CoordSpace {
@@ -683,5 +709,62 @@ mod tests {
             .input()
             .log
             .contains(&InputOp::Type("héllo 🐺".into())));
+    }
+
+    #[test]
+    fn guard_denial_fails_in_place_and_batch_continues() {
+        let mut ex = executor();
+        let r = ex.execute(&Batch(vec![
+            Action::Keypress {
+                keys: vec!["ctrl".into(), "alt".into(), "del".into()],
+            },
+            Action::Wait { ms: 5 },
+        ]));
+        assert!(!r.all_ok());
+        assert!(matches!(
+            r.outcomes[0],
+            ActionOutcome::Failed {
+                error: ExecError::Guard(_)
+            }
+        ));
+        // Guard failures are not infra failures: never retried, batch lived on.
+        if let ActionOutcome::Failed { error } = &r.outcomes[0] {
+            assert!(!error.retryable());
+        } else {
+            panic!("expected failure");
+        }
+        assert!(matches!(r.outcomes[1], ActionOutcome::NoOp));
+        // Nothing was sent to the input backend for the denied keypress.
+        assert!(ex.input().log.is_empty());
+    }
+
+    #[test]
+    fn guard_needs_confirm_is_a_guard_failure() {
+        let mut ex = executor();
+        let r = ex.execute(&Batch(vec![Action::Type {
+            text: "rm -rf ~/tmp".into(),
+        }]));
+        assert!(matches!(
+            r.outcomes[0],
+            ActionOutcome::Failed {
+                error: ExecError::Guard(_)
+            }
+        ));
+        assert!(ex.input().log.is_empty());
+    }
+
+    #[test]
+    fn custom_policy_replaces_default() {
+        let mut ex = executor();
+        // Permissive policy: the default would deny ctrl+alt+del.
+        ex.set_policy(Policy {
+            denied_keypresses: vec![],
+            deny_tty_switch: false,
+            ..Policy::default()
+        });
+        let r = ex.execute(&Batch(vec![Action::Keypress {
+            keys: vec!["ctrl".into(), "alt".into(), "del".into()],
+        }]));
+        assert!(r.all_ok());
     }
 }
