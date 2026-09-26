@@ -1,0 +1,17 @@
+[package]
+name = "pcu-host"
+version = "0.1.0"
+edition = "2021"
+description = "Real-backend host for the pcu JSON-RPC stdio server: wires UInputBackend/SpectacleCapture/KWinWindows into pcu_stdio::Server. Compiles anywhere; only runs on a live Plasma 6 session (constructors probe and name what's missing)."
+
+[[bin]]
+name = "pcu-host"
+path = "src/main.rs"
+
+[dependencies]
+pcu-core = { path = "../core" }
+pcu-backends = { path = "../backends" }
+pcu-mcp = { path = "../mcp" }
+pcu-stdio = { path = "../stdio" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

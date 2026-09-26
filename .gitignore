@@ -1,0 +1,17 @@
+# Rust
+target/
+Cargo.lock.bak
+
+# Research material (cloned/vendored upstream projects; not part of this codebase)
+repos/
+references/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Local runtime artifacts
+*.db
+*.db-wal
+*.db-shm

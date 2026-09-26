@@ -1,0 +1,11 @@
+[package]
+name = "pcu-backends"
+version = "0.1.0"
+edition = "2021"
+description = "Real Plasma 6 backends for pcu-core: absolute-uinput input, spectacle capture, KWin window listing. Compiles anywhere; needs a live session + /dev/uinput at runtime."
+
+[dependencies]
+pcu-core = { path = "../core" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
