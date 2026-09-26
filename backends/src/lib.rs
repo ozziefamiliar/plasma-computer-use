@@ -10,16 +10,15 @@
 //!   PNG's own dimensions.
 //! - [`kwin::KWinWindows`] — window listing via KWin scripting
 //!   (`org.kde.kwin.Scripting.loadScript`, file-based on Plasma 6) driven
-//!   over the `qdbus` CLI.
+//!   over D-Bus with a temporary result callback.
 //!
 //! Everything here compiles on any Linux box; it only *runs* on a live
 //! Plasma 6 session with the right tools and permissions (`/dev/uinput`
-//! writable, `spectacle`, `kscreen-doctor`, `qdbus`). Constructors are honest
-//! about that: they probe and return [`pcu_core::result::ExecError::Infra`]
-//! naming the missing piece instead of failing obscurely later.
+//! writable, `spectacle`, `kscreen-doctor`, a reachable KWin session bus).
+//! Input setup probes eagerly; capture and window backends probe on use.
 //!
-//! Nothing here is live-tested yet — that needs the Arch machine (see the
-//! `LIVE-VALIDATION` notes in each module). The unit tests cover the parts
+//! KWin window queries have been live-tested on Plasma 6.7.5; capture and input
+//! retain their separate `LIVE-VALIDATION` notes. The unit tests cover the parts
 //! that don't need hardware: ioctl number math, the keycode table, PNG
 //! header parsing, kscreen JSON parsing, and the KWin script generators.
 
@@ -27,6 +26,6 @@ pub mod kwin;
 pub mod spectacle;
 pub mod uinput;
 
-pub use kwin::{KWinWindows, QdbusChannel};
+pub use kwin::{DbusChannel, KWinWindows, QdbusChannel};
 pub use spectacle::{KScreenDoctor, SpectacleCapture};
 pub use uinput::UInputBackend;

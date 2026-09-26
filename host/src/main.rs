@@ -5,7 +5,7 @@
 //!
 //! - [`SpectacleCapture`] — fullscreen capture via `spectacle`, measured `CoordSpace`.
 //! - [`UInputBackend`] — absolute uinput pointer + wheel + keyboard.
-//! - [`KWinWindows`] — window listing via KWin scripting over `qdbus`.
+//! - [`KWinWindows`] — window listing via KWin scripting and D-Bus callbacks.
 //! - [`RealClock`] — the executor's timing policy sleeps for real.
 //!
 //! Constructors probe their environment and fail with
@@ -21,6 +21,7 @@
 use pcu_backends::spectacle::{GeometryProbe, KScreenDoctor, LogicalMonitor, SpectacleCapture};
 use pcu_backends::uinput::UInputBackend;
 use pcu_backends::KWinWindows;
+use pcu_core::backend::WindowBackend;
 use pcu_core::frame::DesktopGeometry;
 use pcu_core::result::ExecError;
 use pcu_core::{Executor, RealClock, Timing};
@@ -101,8 +102,11 @@ fn doctor() -> bool {
             which("spectacle").ok_or_else(|| "spectacle not found on PATH".to_string()),
         ),
         check(
-            "qdbus",
-            which("qdbus").ok_or_else(|| "qdbus not found on PATH".to_string()),
+            "kwin",
+            KWinWindows::try_new()
+                .list_windows()
+                .map(|windows| format!("script callback succeeded, {} window(s)", windows.len()))
+                .map_err(err_string),
         ),
     ];
     let report = serde_json::json!({
@@ -139,7 +143,7 @@ fn usage() {
          Reads line-delimited JSON-RPC requests on stdin, writes responses on\n\
          stdout. --mime names the screenshot content type (default image/png,\n\
          since spectacle emits PNG). --doctor probes uinput, the desktop\n\
-         geometry, spectacle and qdbus, prints a JSON readiness report, and\n\
+         geometry, spectacle and KWin window queries, prints a JSON readiness report, and\n\
          exits without serving."
     );
 }
