@@ -46,25 +46,116 @@ pub trait InputBackend {
     fn keypress(&mut self, keys: &[String]) -> Result<(), ExecError>;
     /// Insert literal Unicode text; never silently drop unlayoutable chars.
     fn type_text(&mut self, text: &str) -> Result<(), ExecError>;
+    /// Release everything this backend could plausibly hold: every mouse
+    /// button and every modifier key.
+    ///
+    /// The executor calls this as a last resort in its end-of-batch
+    /// stuck-input sweep, when its own per-button `release()` failed. The
+    /// default errors: a backend that can't enumerate what it holds must
+    /// not claim a successful cleanup. Override with a real implementation
+    /// — emitting release for an already-released key is a harmless no-op
+    /// on evdev, so enumerate everything rather than track state.
+    fn release_all(&mut self) -> Result<(), ExecError> {
+        Err(ExecError::Backend(
+            "release_all not implemented by this backend".into(),
+        ))
+    }
 }
 
-/// Describes one top-level window.
-#[derive(Debug, Clone, PartialEq)]
+/// Describes one top-level window. `Serialize` so transports (MCP, debug
+/// log) can hand the model the exact shape it acted on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WindowInfo {
     pub id: u64,
     pub title: String,
     pub app_id: String,
     pub focused: bool,
+    /// Frame-geometry bounds in desktop logical pixels, if the backend
+    /// reports them. `None` means "not reported", not "zero-sized".
+    pub bounds: Option<WindowBounds>,
 }
 
-/// Window management (KWin scripting on the real backend).
-///
-/// Not yet exercised by the action schema — no window actions exist — but the
-/// seam is here so the real KDE backend can implement it alongside capture
-/// and input, and so capability probing has a shape to probe.
+/// Axis-aligned rectangle in desktop logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct WindowBounds {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl WindowBounds {
+    /// True when the point is inside the rectangle (top/left edges inclusive).
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+/// A filter for [`WindowBackend::find_window`]. All set criteria must match
+/// (AND). An empty query matches every window.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WindowQuery {
+    /// Substring match against the window title (case-insensitive).
+    pub title_substr: Option<String>,
+    /// Exact match against the application id.
+    pub app_id: Option<String>,
+    /// Exact match against the backend window id.
+    pub id: Option<u64>,
+}
+
+impl WindowQuery {
+    pub fn matches(&self, w: &WindowInfo) -> bool {
+        if let Some(id) = self.id {
+            if w.id != id {
+                return false;
+            }
+        }
+        if let Some(app) = &self.app_id {
+            if w.app_id != *app {
+                return false;
+            }
+        }
+        if let Some(sub) = &self.title_substr {
+            if !w.title.to_lowercase().contains(&sub.to_lowercase()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Window management (KWin scripting on the real backend), exposed to the
+/// model through the `list_windows` / `active_window` / `focus_window` /
+/// `window_bounds` actions.
 pub trait WindowBackend {
     fn active_window(&mut self) -> Result<Option<WindowInfo>, ExecError>;
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>, ExecError>;
+    /// Bring the window to the front / give it focus. Returns `false` when
+    /// no window with that id exists; `true` means the request was issued
+    /// (focus itself is asynchronous on the compositor — a subsequent
+    /// `active_window` read is the confirmation).
+    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError>;
+    /// Windows matching `query`, newest/most-recently-used first if the
+    /// backend orders them that way. The default implementation filters
+    /// `list_windows`; backends with a cheaper native query can override.
+    fn find_window(&mut self, query: &WindowQuery) -> Result<Vec<WindowInfo>, ExecError> {
+        Ok(self
+            .list_windows()?
+            .into_iter()
+            .filter(|w| query.matches(w))
+            .collect())
+    }
+    /// Frame-geometry bounds of one window, `None` when the window doesn't
+    /// exist (or when the backend doesn't report bounds). The default
+    /// implementation reads `list_windows`; backends with a cheaper
+    /// single-window query can override.
+    fn window_bounds(&mut self, id: u64) -> Result<Option<WindowBounds>, ExecError> {
+        Ok(self
+            .list_windows()?
+            .into_iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.bounds))
+    }
 }
 
 /// A fake capture backend with configurable, *known* geometry.
@@ -119,6 +210,8 @@ pub enum InputOp {
     Wheel { dx: f64, dy: f64 },
     Keypress(Vec<String>),
     Type(String),
+    /// [`InputBackend::release_all`] was called.
+    ReleaseAll,
 }
 
 /// A recording input backend: every call appends to [`MockInput::log`].
@@ -182,11 +275,15 @@ impl InputBackend for MockInput {
         self.log.push(InputOp::Type(text.to_string()));
         Ok(())
     }
+
+    fn release_all(&mut self) -> Result<(), ExecError> {
+        self.maybe_fail()?;
+        self.log.push(InputOp::ReleaseAll);
+        Ok(())
+    }
 }
 
-/// A canned window list. Not exercised by the executor yet (no window
-/// actions in the schema); present so the backend seam is complete and
-/// probed in one place.
+/// A canned window list, driving the window actions in the schema.
 #[derive(Debug, Default)]
 pub struct MockWindow {
     pub windows: Vec<WindowInfo>,
@@ -205,6 +302,16 @@ impl WindowBackend for MockWindow {
 
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>, ExecError> {
         Ok(self.windows.clone())
+    }
+
+    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError> {
+        if !self.windows.iter().any(|w| w.id == id) {
+            return Ok(false);
+        }
+        for w in &mut self.windows {
+            w.focused = w.id == id;
+        }
+        Ok(true)
     }
 }
 
@@ -258,15 +365,135 @@ mod tests {
                 title: "a".into(),
                 app_id: "x".into(),
                 focused: false,
+                bounds: None,
             },
             WindowInfo {
                 id: 2,
                 title: "b".into(),
                 app_id: "y".into(),
                 focused: true,
+                bounds: None,
             },
         ]);
         assert_eq!(w.active_window().unwrap().unwrap().id, 2);
         assert_eq!(w.list_windows().unwrap().len(), 2);
+    }
+
+    fn window_list() -> Vec<WindowInfo> {
+        vec![
+            WindowInfo {
+                id: 1,
+                title: "Konsole — root".into(),
+                app_id: "org.kde.konsole".into(),
+                focused: false,
+                bounds: Some(WindowBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 800.0,
+                    h: 600.0,
+                }),
+            },
+            WindowInfo {
+                id: 2,
+                title: "Mozilla Firefox".into(),
+                app_id: "firefox".into(),
+                focused: true,
+                bounds: Some(WindowBounds {
+                    x: 800.0,
+                    y: 0.0,
+                    w: 1120.0,
+                    h: 900.0,
+                }),
+            },
+        ]
+    }
+
+    #[test]
+    fn focus_window_flips_focus_and_reports_unknown() {
+        let mut w = MockWindow::new(window_list());
+        assert!(w.focus_window(1).unwrap());
+        assert_eq!(w.active_window().unwrap().unwrap().id, 1);
+        assert!(!w.focus_window(99).unwrap());
+        // unknown id leaves the current focus untouched
+        assert_eq!(w.active_window().unwrap().unwrap().id, 1);
+    }
+
+    #[test]
+    fn find_window_filters_by_criteria() {
+        let mut w = MockWindow::new(window_list());
+        let q = WindowQuery {
+            title_substr: Some("firefox".into()),
+            ..Default::default()
+        };
+        let hits = w.find_window(&q).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 2);
+
+        let q = WindowQuery {
+            app_id: Some("org.kde.konsole".into()),
+            ..Default::default()
+        };
+        assert_eq!(w.find_window(&q).unwrap().len(), 1);
+
+        // criteria AND together; empty query matches everything
+        let q = WindowQuery {
+            title_substr: Some("console".into()),
+            app_id: Some("firefox".into()),
+            ..Default::default()
+        };
+        assert!(w.find_window(&q).unwrap().is_empty());
+        assert_eq!(w.find_window(&WindowQuery::default()).unwrap().len(), 2);
+
+        let q = WindowQuery {
+            id: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(w.find_window(&q).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn window_bounds_reads_list_entry() {
+        let mut w = MockWindow::new(window_list());
+        let b = w.window_bounds(2).unwrap().unwrap();
+        assert_eq!(b.w, 1120.0);
+        assert!(b.contains(900.0, 100.0));
+        assert!(!b.contains(799.9, 100.0));
+        assert!(w.window_bounds(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn default_release_all_errors_honestly() {
+        // A backend that doesn't override `release_all` must not claim a
+        // successful cleanup: the sweep reports the button unreleased.
+        struct NoReleaseAll;
+        impl InputBackend for NoReleaseAll {
+            fn move_to(&mut self, _: UInputAbs) -> Result<(), ExecError> {
+                Ok(())
+            }
+            fn press(&mut self, _: MouseButton) -> Result<(), ExecError> {
+                Ok(())
+            }
+            fn release(&mut self, _: MouseButton) -> Result<(), ExecError> {
+                Ok(())
+            }
+            fn wheel(&mut self, _: f64, _: f64) -> Result<(), ExecError> {
+                Ok(())
+            }
+            fn keypress(&mut self, _: &[String]) -> Result<(), ExecError> {
+                Ok(())
+            }
+            fn type_text(&mut self, _: &str) -> Result<(), ExecError> {
+                Ok(())
+            }
+        }
+        let mut b = NoReleaseAll;
+        assert!(matches!(b.release_all(), Err(ExecError::Backend(_))));
+    }
+
+    #[test]
+    fn mock_release_all_logs_the_op() {
+        let mut m = MockInput::new();
+        m.release_all().unwrap();
+        assert_eq!(m.log, vec![InputOp::ReleaseAll]);
     }
 }

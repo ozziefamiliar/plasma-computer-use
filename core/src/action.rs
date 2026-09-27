@@ -26,6 +26,17 @@ pub enum MouseButton {
     Middle,
 }
 
+impl MouseButton {
+    /// Wire name (`"left"` / `"right"` / `"middle"`), for logs and payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MouseButton::Left => "left",
+            MouseButton::Right => "right",
+            MouseButton::Middle => "middle",
+        }
+    }
+}
+
 /// One physical action. Serializes to the JSON shape in the spec, e.g.
 /// `{"type":"click","frame":3,"button":"left","x":400,"y":200}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +92,30 @@ pub enum Action {
 
     /// Sleep before the next action in the batch.
     Wait { ms: u64 },
+
+    /// List top-level windows (filtered when a query field is set; all set
+    /// fields must match, AND semantics). Observation only — allowed under
+    /// the read-only policy.
+    ListWindows {
+        title_substr: Option<String>,
+        app_id: Option<String>,
+    },
+
+    /// The currently focused window, if the backend reports one.
+    /// Observation only — allowed under the read-only policy.
+    ActiveWindow,
+
+    /// Focus the window with this backend id (from a `list_windows` /
+    /// `active_window` result). Reports whether the backend knew the id;
+    /// `false` means nothing was touched. State-changing — denied under
+    /// the read-only policy.
+    FocusWindow { id: u64 },
+
+    /// Bounds (frame geometry, desktop logical pixels) of the window with
+    /// this backend id, reported as a one-element window list. Empty list
+    /// means the backend didn't know the id. Observation only — allowed
+    /// under the read-only policy.
+    WindowBounds { id: u64 },
 }
 
 impl Action {
@@ -92,7 +127,14 @@ impl Action {
             | Action::DoubleClick { frame, .. }
             | Action::Drag { frame, .. }
             | Action::Scroll { frame, .. } => Some(*frame),
-            Action::Screenshot { .. } | Action::Keypress { .. } | Action::Type { .. } | Action::Wait { .. } => None,
+            Action::Screenshot { .. }
+            | Action::Keypress { .. }
+            | Action::Type { .. }
+            | Action::Wait { .. }
+            | Action::ListWindows { .. }
+            | Action::ActiveWindow
+            | Action::FocusWindow { .. }
+            | Action::WindowBounds { .. } => None,
         }
     }
 }
@@ -140,6 +182,44 @@ mod tests {
     }
 
     #[test]
+    fn window_actions_json_round_trip() {
+        let list: Action =
+            serde_json::from_str(r#"{"type":"list_windows","title_substr":"fire","app_id":null}"#)
+                .unwrap();
+        assert_eq!(
+            list,
+            Action::ListWindows {
+                title_substr: Some("fire".into()),
+                app_id: None,
+            }
+        );
+        // Optional fields may be omitted entirely.
+        let bare: Action = serde_json::from_str(r#"{"type":"list_windows"}"#).unwrap();
+        assert_eq!(
+            bare,
+            Action::ListWindows {
+                title_substr: None,
+                app_id: None,
+            }
+        );
+        let focus: Action = serde_json::from_str(r#"{"type":"focus_window","id":12345}"#).unwrap();
+        assert_eq!(focus, Action::FocusWindow { id: 12345 });
+        let bounds: Action = serde_json::from_str(r#"{"type":"window_bounds","id":7}"#).unwrap();
+        assert_eq!(bounds, Action::WindowBounds { id: 7 });
+        let active: Action = serde_json::from_str(r#"{"type":"active_window"}"#).unwrap();
+        assert_eq!(active, Action::ActiveWindow);
+        // Wire names are snake_case, matching the MCP schema's consts.
+        assert_eq!(
+            serde_json::to_value(&Action::ListWindows {
+                title_substr: None,
+                app_id: None,
+            })
+            .unwrap()["type"],
+            "list_windows"
+        );
+    }
+
+    #[test]
     fn frame_binding_extraction() {
         assert_eq!(
             Action::Move {
@@ -155,5 +235,9 @@ mod tests {
             Action::Screenshot { note: None }.frame(),
             None
         );
+        // Window actions carry no frame: no coordinate mapping, no frame
+        // review in the guard.
+        assert_eq!(Action::ActiveWindow.frame(), None);
+        assert_eq!(Action::FocusWindow { id: 1 }.frame(), None);
     }
 }

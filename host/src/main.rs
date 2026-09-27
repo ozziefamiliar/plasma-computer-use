@@ -29,9 +29,9 @@ use pcu_backends::KWinWindows;
 use pcu_core::backend::WindowBackend;
 use pcu_core::frame::DesktopGeometry;
 use pcu_core::result::ExecError;
-use pcu_core::{Executor, RealClock, Timing};
+use pcu_core::{Action, Batch, Executor, RealClock, Timing};
 use pcu_stdio::{serve, Server};
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 
 /// The logical desktop as a bounding box over the probed monitors.
 ///
@@ -144,7 +144,7 @@ fn which(bin: &str) -> Option<String> {
 fn usage() {
     println!(
         "pcu-host: JSON-RPC 2.0 stdio server with real Plasma 6 backends.\n\n\
-         Usage: pcu-host [--mime <type>] [--doctor] [--debug] [--read-only]\n\n\
+         Usage: pcu-host [--mime <type>] [--doctor] [--debug] [--read-only] [--ask-confirm]\n\n\
          Reads line-delimited JSON-RPC requests on stdin, writes responses on\n\
          stdout. --mime names the screenshot content type (default image/png,\n\
          since spectacle emits PNG). --doctor probes uinput, the desktop\n\
@@ -153,8 +153,45 @@ fn usage() {
          batch to stderr (request id, backends, requested actions, elapsed\n\
          ms, per-action outcomes with frame ids/dims/mapped coords/failures).\n\
          --read-only flips the guard to observation mode: only screenshot\n\
-         actions run, everything else is denied in place."
+         actions run, everything else is denied in place. --ask-confirm\n\
+         prompts the operator on the controlling terminal (/dev/tty) whenever\n\
+         an action needs guard confirmation (e.g. destructive typed text);\n\
+         approved actions run in batch order, declined ones fail in place.\n\
+         Without a terminal every confirmation is declined."
     );
+}
+
+/// The operator prompt behind `--ask-confirm`: prints each pending action
+/// to the controlling terminal and reads y/N answers there — never stdin,
+/// which is the JSON-RPC transport. Fail closed: no terminal, no approvals.
+fn ask_operator(batch: &Batch, pending: &[(usize, String)]) -> Vec<usize> {
+    use std::fs::OpenOptions;
+    let mut tty = match OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut reader = match OpenOptions::new().read(true).open("/dev/tty") {
+        Ok(t) => BufReader::new(t),
+        Err(_) => return Vec::new(),
+    };
+    let mut approved = Vec::new();
+    for (i, reason) in pending {
+        let action: &Action = &batch.0[*i];
+        let _ = writeln!(
+            tty,
+            "pcu-host: confirmation needed for action {i} of {}:\n  {action:?}\n  reason: {reason}\napprove? [y/N] ",
+            batch.0.len(),
+        );
+        let _ = tty.flush();
+        let mut line = String::new();
+        let yes = reader.read_line(&mut line).is_ok()
+            && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        let _ = writeln!(tty, "{}", if yes { "approved" } else { "declined" });
+        if yes {
+            approved.push(*i);
+        }
+    }
+    approved
 }
 
 fn main() -> io::Result<()> {
@@ -162,6 +199,7 @@ fn main() -> io::Result<()> {
     let mut doctor_only = false;
     let mut debug = false;
     let mut read_only = false;
+    let mut ask_confirm = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -174,6 +212,7 @@ fn main() -> io::Result<()> {
             "--doctor" => doctor_only = true,
             "--debug" => debug = true,
             "--read-only" => read_only = true,
+            "--ask-confirm" => ask_confirm = true,
             "--help" | "-h" => {
                 usage();
                 return Ok(());
@@ -215,6 +254,10 @@ fn main() -> io::Result<()> {
     if read_only {
         eprintln!("pcu-host: --read-only on: only screenshot actions will run");
         exec.set_read_only(true);
+    }
+    if ask_confirm {
+        eprintln!("pcu-host: --ask-confirm on: destructive actions prompt on /dev/tty");
+        exec.set_confirm_hook(ask_operator);
     }
     let mut server = Server::new(exec, mime);
     if debug {

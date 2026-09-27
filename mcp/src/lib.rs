@@ -27,7 +27,7 @@
 
 use pcu_core::{
     Action, ActionOutcome, Batch, CaptureBackend, Clock, DesktopPoint, Executor, FrameId,
-    InputBackend, WindowBackend,
+    InputBackend, WindowBackend, WindowInfo,
 };
 use serde::Serialize;
 
@@ -96,6 +96,28 @@ struct ActionStatus<'a> {
     error: Option<String>,
 }
 
+/// Payload appended after a successful window action's status line: the
+/// window descriptions (ids the model can feed back into `focus_window` /
+/// `window_bounds`), and for `focus_window` whether the id was known —
+/// `focused: false` means the backend didn't know it, so nothing changed.
+#[derive(Debug, Serialize)]
+struct WindowsPayload<'a> {
+    windows: &'a [WindowInfo],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focused: Option<bool>,
+}
+
+/// Batch-level stuck-input sweep report, appended only when the executor's
+/// end-of-batch cleanup actually did something — or failed to. `released`
+/// names buttons the sweep freed; `unreleased` names buttons that stayed
+/// down even after `release_all`: the desktop may genuinely have a stuck
+/// button and the model's picture of pointer state is suspect.
+#[derive(Debug, Serialize)]
+struct StuckInputPayload<'a> {
+    released: &'a [String],
+    unreleased: &'a [String],
+}
+
 fn action_name(a: &Action) -> &'static str {
     match a {
         Action::Screenshot { .. } => "screenshot",
@@ -107,6 +129,10 @@ fn action_name(a: &Action) -> &'static str {
         Action::Keypress { .. } => "keypress",
         Action::Type { .. } => "type",
         Action::Wait { .. } => "wait",
+        Action::ListWindows { .. } => "list_windows",
+        Action::ActiveWindow => "active_window",
+        Action::FocusWindow { .. } => "focus_window",
+        Action::WindowBounds { .. } => "window_bounds",
     }
 }
 
@@ -152,6 +178,7 @@ where
     for (action, outcome) in args.actions.iter().zip(result.outcomes.iter()) {
         let (status, mapped, error) = match outcome {
             ActionOutcome::Done { mapped } => ("ok", Some(mapped), None),
+            ActionOutcome::Windows { .. } => ("ok", None, None),
             ActionOutcome::NoOp => ("noop", None, None),
             ActionOutcome::Failed { error } => ("error", None, Some(error.to_string())),
         };
@@ -174,6 +201,33 @@ where
                 append_screenshot(exec, id, &mut content, screenshot_mime_type);
             }
         }
+
+        // A successful window action appends its payload: the window
+        // descriptions (id, title, app id, focus state, bounds), and for
+        // `focus_window` whether the id was known.
+        if let ActionOutcome::Windows { windows, focused } = outcome {
+            content.push(Content::text(
+                serde_json::to_string(&WindowsPayload {
+                    windows,
+                    focused: *focused,
+                })
+                .expect("WindowsPayload serializes"),
+            ));
+        }
+    }
+
+    // Stuck-input sweep report: only present when the executor's
+    // end-of-batch cleanup did something or failed to. Rides the normal
+    // content list (like the screenshot and window payloads), so the
+    // --debug log carries it too.
+    if !result.stuck_released.is_empty() || !result.stuck_unreleased.is_empty() {
+        content.push(Content::text(
+            serde_json::to_string(&StuckInputPayload {
+                released: &result.stuck_released,
+                unreleased: &result.stuck_unreleased,
+            })
+            .expect("StuckInputPayload serializes"),
+        ));
     }
 
     CallToolResult {
@@ -210,7 +264,7 @@ pub fn tools_list() -> serde_json::Value {
     serde_json::json!({
         "tools": [{
             "name": TOOL_NAME,
-            "description": "Drive the local Plasma desktop: run a batch of computer-use actions (screenshot, move, click, drag, scroll, keypress, type, wait). Coordinate actions take screenshot-space pixels plus the frame id from a prior screenshot's self-describing payload; a failed action never aborts the rest of the batch.",
+            "description": "Drive the local Plasma desktop: run a batch of computer-use actions (screenshot, move, click, drag, scroll, keypress, type, wait, list_windows, active_window, focus_window, window_bounds). Coordinate actions take screenshot-space pixels plus the frame id from a prior screenshot's self-describing payload; a failed action never aborts the rest of the batch.",
             "inputSchema": input_schema(),
         }]
     })
@@ -285,7 +339,23 @@ fn input_schema() -> serde_json::Value {
                     {"type": "object", "properties": {
                         "type": {"const": "wait"},
                         "ms": {"type": "integer", "description": "Sleep before the next action in the batch."}
-                    }, "required": ["type", "ms"]}
+                    }, "required": ["type", "ms"]},
+                    {"type": "object", "properties": {
+                        "type": {"const": "list_windows"},
+                        "title_substr": {"type": ["string", "null"], "description": "Substring match against window titles (case-insensitive)."},
+                        "app_id": {"type": ["string", "null"], "description": "Exact match against the application id."}
+                    }, "required": ["type"]},
+                    {"type": "object", "properties": {
+                        "type": {"const": "active_window"}
+                    }, "required": ["type"], "description": "The currently focused window, if the backend reports one."},
+                    {"type": "object", "properties": {
+                        "type": {"const": "focus_window"},
+                        "id": {"type": "integer", "description": "Backend window id from a list_windows / active_window result. focused:false means the id was unknown and nothing changed."}
+                    }, "required": ["type", "id"]},
+                    {"type": "object", "properties": {
+                        "type": {"const": "window_bounds"},
+                        "id": {"type": "integer", "description": "Backend window id from a list_windows / active_window result. Returns a one-element window list; empty means the id was unknown."}
+                    }, "required": ["type", "id"]}
                 ]}
             }
         },
@@ -356,7 +426,8 @@ mod base64 {
 mod tests {
     use super::*;
     use pcu_core::{
-        CoordSpace, DesktopGeometry, MockCapture, MockInput, MockWindow, MockClock, Timing,
+        CoordSpace, DesktopGeometry, ExecError, Executor, InputBackend, MockCapture, MockClock,
+        MockInput, MockWindow, MouseButton, Timing, UInputAbs,
     };
 
     fn identity_space() -> CoordSpace {
@@ -501,5 +572,153 @@ mod tests {
             v["content"][1],
             serde_json::json!({"type": "image", "data": "AA==", "mimeType": "image/png"})
         );
+    }
+
+    fn windowed_executor() -> Executor<MockCapture, MockInput, MockWindow, MockClock> {
+        use pcu_core::{WindowBounds, WindowInfo};
+        Executor::new(
+            MockCapture::new(identity_space()),
+            MockInput::new(),
+            MockWindow::new(vec![WindowInfo {
+                id: 7,
+                title: "Konsole".into(),
+                app_id: "org.kde.konsole".into(),
+                focused: true,
+                bounds: Some(WindowBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 800.0,
+                    h: 600.0,
+                }),
+            }]),
+            MockClock::new(),
+            Timing::default(),
+            DesktopGeometry::single(1920.0, 1080.0),
+        )
+    }
+
+    #[test]
+    fn list_windows_batch_yields_window_payload() {
+        let mut ex = windowed_executor();
+        let r = call_tool(
+            &mut ex,
+            TOOL_NAME,
+            &serde_json::json!({"actions": [{"type": "list_windows"}]}),
+            "image/png",
+        );
+        assert!(!r.is_error);
+        assert_eq!(r.content.len(), 2);
+
+        // 1: status line
+        let status: serde_json::Value = serde_json::from_str(text_of(&r.content[0])).unwrap();
+        assert_eq!(status["action"], "list_windows");
+        assert_eq!(status["status"], "ok");
+
+        // 2: window descriptions the model can feed back into focus_window
+        let payload: serde_json::Value = serde_json::from_str(text_of(&r.content[1])).unwrap();
+        assert_eq!(payload["windows"].as_array().unwrap().len(), 1);
+        let w = &payload["windows"][0];
+        assert_eq!(w["id"], 7);
+        assert_eq!(w["title"], "Konsole");
+        assert_eq!(w["app_id"], "org.kde.konsole");
+        assert_eq!(w["focused"], true);
+        assert_eq!(w["bounds"]["w"], 800.0);
+        assert!(payload.get("focused").is_none());
+    }
+
+    #[test]
+    fn focus_window_reports_unknown_id_without_error() {
+        let mut ex = windowed_executor();
+        let r = call_tool(
+            &mut ex,
+            TOOL_NAME,
+            &serde_json::json!({"actions": [{"type": "focus_window", "id": 999}]}),
+            "image/png",
+        );
+        assert!(!r.is_error);
+        let status: serde_json::Value = serde_json::from_str(text_of(&r.content[0])).unwrap();
+        assert_eq!(status["status"], "ok");
+        let payload: serde_json::Value = serde_json::from_str(text_of(&r.content[1])).unwrap();
+        assert_eq!(payload["focused"], false);
+        assert_eq!(payload["windows"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn schema_describes_all_four_window_actions() {
+        let schema = tools_list();
+        let items = &schema["tools"][0]["inputSchema"]["properties"]["actions"]["items"]["oneOf"];
+        let consts: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["properties"]["type"]["const"].as_str().unwrap())
+            .collect();
+        for t in ["list_windows", "active_window", "focus_window", "window_bounds"] {
+            assert!(consts.contains(&t), "schema missing {t}");
+        }
+    }
+
+    /// Input backend whose `release` always fails with a non-retryable
+    /// error; `release_all` delegates to the inner mock (succeeds).
+    struct StuckInput {
+        inner: MockInput,
+    }
+
+    impl InputBackend for StuckInput {
+        fn move_to(&mut self, p: UInputAbs) -> Result<(), ExecError> {
+            self.inner.move_to(p)
+        }
+        fn press(&mut self, b: MouseButton) -> Result<(), ExecError> {
+            self.inner.press(b)
+        }
+        fn release(&mut self, _: MouseButton) -> Result<(), ExecError> {
+            Err(ExecError::Backend("release line is down".into()))
+        }
+        fn wheel(&mut self, dx: f64, dy: f64) -> Result<(), ExecError> {
+            self.inner.wheel(dx, dy)
+        }
+        fn keypress(&mut self, keys: &[String]) -> Result<(), ExecError> {
+            self.inner.keypress(keys)
+        }
+        fn type_text(&mut self, text: &str) -> Result<(), ExecError> {
+            self.inner.type_text(text)
+        }
+        fn release_all(&mut self) -> Result<(), ExecError> {
+            self.inner.release_all()
+        }
+    }
+
+    #[test]
+    fn stuck_sweep_report_is_appended_to_the_wire() {
+        let mut ex = Executor::new(
+            MockCapture::new(identity_space()),
+            StuckInput { inner: MockInput::new() },
+            MockWindow::default(),
+            MockClock::new(),
+            Timing::default(),
+            DesktopGeometry::single(1920.0, 1080.0),
+        );
+        let args = serde_json::json!({"actions": [
+            {"type": "screenshot", "note": null},
+            {"type": "click", "frame": 1, "button": "left", "x": 10, "y": 10},
+        ]});
+        let r = call_tool(&mut ex, "computer_use", &args, "image/png");
+        assert!(!r.is_error);
+        // The click failed, the sweep's per-button release failed too, and
+        // release_all cleaned up: the trailing payload says so.
+        let last = text_of(r.content.last().unwrap());
+        assert!(last.contains(r#""released":["left"]"#), "got: {last}");
+        assert!(last.contains(r#""unreleased":[]"#), "got: {last}");
+    }
+
+    #[test]
+    fn no_stuck_payload_on_a_clean_batch() {
+        let mut ex = executor();
+        let args = serde_json::json!({"actions": [
+            {"type": "wait", "ms": 5},
+        ]});
+        let r = call_tool(&mut ex, "computer_use", &args, "image/png");
+        assert!(!r.is_error);
+        assert_eq!(r.content.len(), 1); // just the status line, no payload
     }
 }

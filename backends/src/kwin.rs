@@ -45,10 +45,18 @@ fn list_windows_script() -> String {
     : workspace.clientList();
   for (var i = 0; i < list.length; i++) {
     var w = list[i];
+    var bounds = null;
+    try {
+      var fg = w.frameGeometry;
+      if (fg) {
+        bounds = { x: fg.x, y: fg.y, width: fg.width, height: fg.height };
+      }
+    } catch (e) {}
     out.push({
       id: (w.internalId || w.windowId || i).toString(),
       title: String(w.caption || ""),
-      app_id: String(w.resourceClass || w.resourceName || "")
+      app_id: String(w.resourceClass || w.resourceName || ""),
+      bounds: bounds
     });
   }
   pcuReport(JSON.stringify(out));
@@ -75,6 +83,46 @@ fn active_window_script() -> String {
     .to_string()
 }
 
+/// JSON-encode a string as a JS literal. `{:?}` would ~work for ASCII ids but
+/// diverges from JS escape syntax on exotic codepoints; JSON strings are a
+/// subset of JS string literals, so this is always safe to paste in.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).expect("serde_json cannot fail on &str")
+}
+
+fn activate_window_script(target_id: &str) -> String {
+    format!(
+        r#"
+(function() {{
+  var target = {target};
+  var list = (typeof workspace.windowList === "function")
+    ? workspace.windowList()
+    : workspace.clientList();
+  var found = false;
+  for (var i = 0; i < list.length; i++) {{
+    var w = list[i];
+    var id = (w.internalId || w.windowId || i).toString();
+    if (id === target) {{
+      workspace.activeWindow = w;
+      found = true;
+      break;
+    }}
+  }}
+  pcuReport(found ? "true" : "false");
+}})();
+"#,
+        target = js_string_literal(target_id)
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ScriptBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 #[derive(serde::Deserialize)]
 struct ScriptWindow {
     id: String,
@@ -82,6 +130,8 @@ struct ScriptWindow {
     title: String,
     #[serde(default)]
     app_id: Option<String>,
+    #[serde(default)]
+    bounds: Option<ScriptBounds>,
 }
 
 /// FNV-1a 64: stable string→u64 for KWin's string window ids.
@@ -311,6 +361,12 @@ impl<C: ScriptChannel> KWinWindows<C> {
             title: w.title,
             app_id: w.app_id.unwrap_or_default(),
             focused,
+            bounds: w.bounds.map(|b| pcu_core::backend::WindowBounds {
+                x: b.x,
+                y: b.y,
+                w: b.width,
+                h: b.height,
+            }),
         }
     }
 
@@ -358,6 +414,29 @@ impl<C: ScriptChannel> WindowBackend for KWinWindows<C> {
             })
             .collect())
     }
+
+    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError> {
+        // The trait's ids are FNV-1a hashes of KWin's string ids, which are
+        // not invertible — so list first to recover the string id, then run
+        // the targeted activate script (wdotool's `workspace.activeWindow =
+        // w` recipe). The list's focused flags are discarded; focus itself
+        // is asynchronous, so the caller confirms with `active_window`.
+        let payload = self
+            .channel
+            .eval(&list_windows_script())?
+            .unwrap_or_else(|| "[]".to_string());
+        let target = Self::parse_list(&payload)?
+            .into_iter()
+            .find(|w| fnv1a(&w.id) == id);
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        let payload = self.channel.eval(&activate_window_script(&target.id))?;
+        Ok(payload
+            .as_deref()
+            .map(|p| p.trim() == "true")
+            .unwrap_or(false))
+    }
 }
 
 #[cfg(test)]
@@ -378,13 +457,14 @@ mod tests {
             results.insert(
                 "list",
                 Some(
-                    r#"[{"id":"11","title":"Terminal","app_id":"org.kde.konsole"},{"id":"22","title":"Firefox","app_id":"firefox"}]"#.to_string(),
+                    r#"[{"id":"11","title":"Terminal","app_id":"org.kde.konsole","bounds":{"x":0,"y":0,"width":800,"height":600}},{"id":"22","title":"Firefox","app_id":"firefox","bounds":null}]"#.to_string(),
                 ),
             );
             results.insert(
                 "active",
                 Some(r#"{"id":"22","title":"Firefox","app_id":"firefox"}"#.to_string()),
             );
+            results.insert("activate", Some("true".to_string()));
             Self {
                 results,
                 seen_scripts: RefCell::new(Vec::new()),
@@ -395,7 +475,10 @@ mod tests {
     impl ScriptChannel for FakeChannel {
         fn eval(&mut self, script: &str) -> Result<Option<String>, ExecError> {
             self.seen_scripts.borrow_mut().push(script.to_string());
-            let key = if script.contains("windowList") {
+            // the activate script contains "windowList" too — check it first
+            let key = if script.contains("activeWindow = w") {
+                "activate"
+            } else if script.contains("windowList") {
                 "list"
             } else {
                 "active"
@@ -432,6 +515,71 @@ mod tests {
         // ids are stable string hashes, distinct per window
         assert_ne!(wins[0].id, wins[1].id);
         assert_eq!(wins[0].id, fnv1a("11"));
+    }
+
+    #[test]
+    fn list_windows_reports_bounds() {
+        let mut b = KWinWindows::with_channel(FakeChannel::new());
+        let wins = b.list_windows().unwrap();
+        let bounds = wins[0].bounds.unwrap();
+        assert_eq!(bounds.w, 800.0);
+        assert_eq!(bounds.h, 600.0);
+        assert!(bounds.contains(10.0, 10.0));
+        // null bounds stay None, not zero-sized
+        assert!(wins[1].bounds.is_none());
+    }
+
+    #[test]
+    fn activate_script_targets_id_and_reports() {
+        let s = activate_window_script("22");
+        assert!(s.contains("workspace.activeWindow = w"));
+        assert!(s.contains("windowList"));
+        assert!(s.contains("\"22\"")); // JS-safe string literal
+        assert!(s.contains(r#"found ? "true" : "false""#));
+    }
+
+    #[test]
+    fn activate_script_escapes_tricky_ids() {
+        // a quote in the id must not break the JS string literal
+        let s = activate_window_script("a\"; evil(); //");
+        assert!(s.contains("a\\\"; evil(); //"));
+    }
+
+    #[test]
+    fn focus_window_activates_known_id() {
+        let ch = FakeChannel::new();
+        let mut b = KWinWindows::with_channel(ch);
+        assert!(b.focus_window(fnv1a("22")).unwrap());
+        let seen = b.channel.seen_scripts.borrow();
+        let activate: Vec<_> = seen
+            .iter()
+            .filter(|s| s.contains("activeWindow = w"))
+            .collect();
+        assert_eq!(activate.len(), 1);
+        assert!(activate[0].contains("\"22\""));
+    }
+
+    #[test]
+    fn focus_window_false_for_unknown_id() {
+        let ch = FakeChannel::new();
+        let mut b = KWinWindows::with_channel(ch);
+        assert!(!b.focus_window(fnv1a("nope")).unwrap());
+        // unknown id: no activate script ever ran
+        assert!(!b
+            .channel
+            .seen_scripts
+            .borrow()
+            .iter()
+            .any(|s| s.contains("activeWindow = w")));
+    }
+
+    #[test]
+    fn focus_window_false_when_script_reports_miss() {
+        let mut ch = FakeChannel::new();
+        ch.results.insert("activate", Some("false".to_string()));
+        let mut b = KWinWindows::with_channel(ch);
+        // id exists in the list, but the script says it didn't find it
+        assert!(!b.focus_window(fnv1a("11")).unwrap());
     }
 
     #[test]

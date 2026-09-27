@@ -156,6 +156,10 @@ const KEY_INSERT: u16 = 110;
 const KEY_DELETE: u16 = 111;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
+// Right-side modifiers have no key_code() name yet, but `release_all`
+// needs them (a stuck chord could hold either side).
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_RIGHTALT: u16 = 100;
 
 /// Every key the keyboard device registers. `keypress`/`type_text` can only
 /// ever emit codes from this table; unknown names fail as `Backend` errors
@@ -166,10 +170,10 @@ const ALL_KEYS: &[u16] = &[
     KEY_O, KEY_P, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER, KEY_LEFTCTRL, KEY_A, KEY_S, KEY_D,
     KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE,
     KEY_LEFTSHIFT, KEY_BACKSLASH, KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M, KEY_COMMA,
-    KEY_DOT, KEY_SLASH, KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_SPACE, KEY_F1, KEY_F2, KEY_F3, KEY_F4,
+    KEY_DOT, KEY_SLASH, KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_RIGHTALT, KEY_SPACE, KEY_F1, KEY_F2, KEY_F3, KEY_F4,
     KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, KEY_HOME, KEY_UP,
     KEY_PAGEUP, KEY_LEFT, KEY_RIGHT, KEY_END, KEY_DOWN, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE,
-    KEY_LEFTMETA, KEY_RIGHTMETA,
+    KEY_RIGHTCTRL, KEY_LEFTMETA, KEY_RIGHTMETA,
 ];
 
 // ---- repr(C) structs (linux/input.h, linux/uinput.h) ------------------------
@@ -653,6 +657,35 @@ impl InputBackend for UInputBackend {
     fn release(&mut self, button: MouseButton) -> Result<(), ExecError> {
         let code = Self::button_code(button);
         self.pointer.emit(&[(EV_KEY, code, 0)])
+    }
+
+    fn release_all(&mut self) -> Result<(), ExecError> {
+        // Buttons first, then modifiers: a stuck drag holds Left; a stuck
+        // chord (`keypress`/`type_text` failing mid-sequence) holds
+        // modifiers. Releasing an already-released key is a harmless no-op
+        // on evdev, so enumerate everything rather than track state. Both
+        // sides of each modifier are covered (they're all in ALL_KEYS, so
+        // the device accepts the events).
+        for b in [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+        ] {
+            self.release(b)?;
+        }
+        for code in [
+            KEY_LEFTCTRL,
+            KEY_RIGHTCTRL,
+            KEY_LEFTSHIFT,
+            KEY_RIGHTSHIFT,
+            KEY_LEFTALT,
+            KEY_RIGHTALT,
+            KEY_LEFTMETA,
+            KEY_RIGHTMETA,
+        ] {
+            self.key_event(code, false)?;
+        }
+        Ok(())
     }
 
     fn wheel(&mut self, dx: f64, dy: f64) -> Result<(), ExecError> {

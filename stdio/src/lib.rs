@@ -7,7 +7,8 @@
 //! router with its own line splitting.
 //!
 //! Handled methods: `initialize`, `notifications/initialized` (no reply),
-//! `tools/list`, `tools/call`, `ping`. Anything else is JSON-RPC
+//! `tools/list`, `tools/call`, `notifications/cancelled` (arms emergency
+//! cancellation, no reply), `ping`. Anything else is JSON-RPC
 //! `-32601 Method not found`. Transport-level tool problems (unknown tool,
 //! bad arguments) do **not** become JSON-RPC errors: `pcu_mcp::call_tool`
 //! reports them as MCP `isError` results, keeping the wire level for wire
@@ -18,6 +19,9 @@ use pcu_core::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// Optional `--debug` JSON-lines logging for `tools/call` batches.
+pub mod debug;
 
 /// The MCP protocol version this loop claims to speak.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -37,6 +41,9 @@ where
     /// capture bytes are opaque to the core (e.g. `"image/png"` for a real
     /// PNG backend, `"application/octet-stream"` for the mock demo).
     pub screenshot_mime: String,
+    /// Optional debug sink. `None` (the default) disables logging;
+    /// [`Server::with_debug`] attaches one.
+    debug: Option<debug::DebugLogger>,
 }
 
 impl<C, I, W, K> Server<C, I, W, K>
@@ -50,7 +57,16 @@ where
         Self {
             exec,
             screenshot_mime: screenshot_mime.into(),
+            debug: None,
         }
+    }
+
+    /// Attach a debug sink: every `tools/call` batch then emits one JSON
+    /// line (request id, backends, requested actions, elapsed ms, result
+    /// with frame ids/dims/mapped coords/failures) to `sink`.
+    pub fn with_debug(mut self, sink: impl std::io::Write + 'static) -> Self {
+        self.debug = Some(debug::DebugLogger::new(sink));
+        self
     }
 }
 
@@ -121,6 +137,24 @@ where
         "notifications/initialized" => {
             return None; // notification: no response, ever
         }
+        // MCP cancellation: params carry {"requestId": <id>}. Arming the
+        // executor's cancel flag drains the batch at the next action
+        // boundary; the flag is one-shot, so a cancel for an already
+        // finished request can't poison a later one. Note the transport
+        // limit: this single-threaded loop can't read the cancel line
+        // until the in-flight batch returns, so the flag takes effect at
+        // the first boundary of the *next* batch. A host that runs
+        // execute() on a worker thread and hands it a CancelHandle gets
+        // true mid-batch cancellation.
+        "notifications/cancelled" => {
+            if let Some(dbg) = server.debug.as_mut() {
+                dbg.log(
+                    &serde_json::json!({"event": "cancel", "request_id": params.get("requestId")}),
+                );
+            }
+            server.exec.cancel();
+            return None; // notification: no response, ever
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(pcu_mcp::tools_list()),
         "tools/call" => {
@@ -135,12 +169,22 @@ where
                 }
             };
             let arguments = params.get("arguments").unwrap_or(&Value::Null);
+            let t0 = std::time::Instant::now();
             let result = pcu_mcp::call_tool(
                 &mut server.exec,
                 name,
                 arguments,
                 &server.screenshot_mime,
             );
+            if let Some(dbg) = server.debug.as_mut() {
+                dbg.log(&debug::batch_event(
+                    &id,
+                    arguments,
+                    &result,
+                    debug::backend_names::<C, I, W, K>(),
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                ));
+            }
             Ok(result.to_json())
         }
         other => Err((-32601, format!("method not found: {:?}", other))),
@@ -369,6 +413,48 @@ mod tests {
         assert_eq!(resp(lines[2])["result"]["content"].as_array().unwrap().len(), 3);
     }
 
+    /// `notifications/cancelled` arms emergency cancellation (no response),
+    /// and the next batch drains every action as cancelled; the flag is
+    /// one-shot, so the batch after that runs clean.
+    #[test]
+    fn cancelled_notification_arms_executor() {
+        let mut s = mock_server();
+        // Notification: no id, no response — even though it names a request.
+        assert_eq!(
+            handle_request(
+                &mut s,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#
+            ),
+            None
+        );
+        let req = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
+            "name": "computer_use",
+            "arguments": {"actions": [
+                {"type": "screenshot", "note": null},
+                {"type": "click", "frame": 1, "button": "left", "x": 10, "y": 10}
+            ]}
+        }}"#;
+        let line = handle_request(&mut s, req).expect("response");
+        let v = resp(&line);
+        assert_eq!(v["id"], 8);
+        let content = v["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        for item in content {
+            let status: Value =
+                serde_json::from_str(item["text"].as_str().unwrap()).unwrap();
+            assert_eq!(status["status"], "error");
+            assert!(status["error"].as_str().unwrap().contains("cancelled"));
+        }
+        // One-shot: the following batch runs normally.
+        let line = handle_request(&mut s, req).expect("response");
+        let v = resp(&line);
+        assert_eq!(v["result"]["isError"], false);
+        let content = v["result"]["content"].as_array().unwrap();
+        let status: Value =
+            serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(status["status"], "ok");
+    }
+
     #[test]
     fn ping_round_trips() {
         let mut s = mock_server();
@@ -377,5 +463,103 @@ mod tests {
         let v = resp(&line);
         assert_eq!(v["id"], 9);
         assert_eq!(v["result"], json!({}));
+    }
+
+    /// `with_debug` server: one JSON debug line per tools/call batch, with
+    /// frame id, dims, mapped coords, requested actions, backends, timing,
+    /// and failures (here: none).
+    #[test]
+    fn debug_logs_one_line_per_batch() {
+        use std::cell::RefCell;
+        use std::io::Write;
+        use std::rc::Rc;
+        struct Shared(Rc<RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shared = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut s = mock_server().with_debug(Shared(shared.clone()));
+        let req = r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{
+            "name": "computer_use",
+            "arguments": {"actions": [
+                {"type": "screenshot", "note": null},
+                {"type": "click", "frame": 1, "button": "left", "x": 960, "y": 540}
+            ]}
+        }}"#;
+        handle_request(&mut s, req).expect("response");
+
+        let text = String::from_utf8(shared.borrow().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one debug line per batch");
+        let ev: Value = serde_json::from_str(lines[0]).expect("debug line is JSON");
+
+        assert_eq!(ev["event"], "batch");
+        assert_eq!(ev["request_id"], 42);
+        assert!(ev["elapsed_ms"].as_f64().unwrap() >= 0.0);
+        // Backend type names name the mock backends.
+        assert!(ev["backend"]["capture"].as_str().unwrap().contains("MockCapture"));
+        assert!(ev["backend"]["input"].as_str().unwrap().contains("MockInput"));
+        // Requested actions verbatim.
+        assert_eq!(ev["requested"]["actions"].as_array().unwrap().len(), 2);
+        assert_eq!(ev["requested"]["actions"][0]["type"], "screenshot");
+        // Result: screenshot status + self-describing payload + image +
+        // click status with mapped desktop coords.
+        assert_eq!(ev["result"]["isError"], false);
+        let content = ev["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 4);
+        let desc: Value =
+            serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(desc["frame_id"], 1);
+        assert_eq!(desc["width"], 1920);
+        assert_eq!(desc["height"], 1080);
+        let click: Value =
+            serde_json::from_str(content[3]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(click["status"], "ok");
+        assert_eq!(click["mapped"][0]["x"], 960.0);
+        assert_eq!(click["mapped"][0]["y"], 540.0);
+    }
+
+    /// Debug lines also record failures: here a click on an unknown frame.
+    #[test]
+    fn debug_line_records_failures() {
+        use std::cell::RefCell;
+        use std::io::Write;
+        use std::rc::Rc;
+        struct Shared(Rc<RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shared = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut s = mock_server().with_debug(Shared(shared.clone()));
+        let req = r#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{
+            "name": "computer_use",
+            "arguments": {"actions": [
+                {"type": "click", "frame": 99, "button": "left", "x": 10, "y": 10}
+            ]}
+        }}"#;
+        handle_request(&mut s, req).expect("response");
+
+        let text = String::from_utf8(shared.borrow().clone()).unwrap();
+        let ev: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(ev["result"]["isError"], false); // per-action, not transport
+        let content = ev["result"]["content"].as_array().unwrap();
+        let status: Value =
+            serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(status["status"], "error");
+        assert!(status["error"].as_str().unwrap().contains("99"));
     }
 }
