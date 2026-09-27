@@ -1,57 +1,35 @@
-//! Window listing via KWin scripting over the `qdbus` CLI.
+//! Window queries over KWin's session D-Bus scripting API.
 //!
-//! The recipe is wdotool's (vendored at
-//! `references/wdotool_kde_backend.rs`), minus the async zbus bridge:
+//! KWin provides `readConfig`, but no `writeConfig` global. Each query loads
+//! a temporary script and returns its result through `callDBus` to a private
+//! connection's unique bus name. No window titles enter kwinrc or the journal.
+//! The callback is installed before running the script and accepts only the
+//! current KWin owner's messages. Calls and result waits have bounded timeouts;
+//! loaded scripts are unloaded on both success and failure.
 //!
-//! 1. generate a JS snippet (dual `windowList()`/`clientList()` for
-//!    Plasma 6/5, JSON payload, `internalId || windowId` ids),
-//! 2. write it to a temp file — Plasma 6 removed `loadScriptFromText`, so
-//!    `org.kde.kwin.Scripting.loadScript(path, pluginName)` is the only
-//!    path, and the file must stay alive until after the run (KWin reads
-//!    lazily on some versions),
-//! 3. `run()` the per-script object at `/Scripting/Script{id}` (Plasma 6
-//!    does not auto-run loaded scripts),
-//! 4. read the result the script left via `writeConfig`, then
-//!    `unloadScript` and delete the temp file.
-//!
-//! The one deliberate deviation: instead of wdotool's zbus callback bridge
-//! (needs an async runtime + a D-Bus object server), the script reports via
-//! the scripting API's `writeConfig(key, value)` and this backend polls the
-//! value with `kreadconfig6`. Synchronous, zero new dependencies, and the
-//! 3s-timeout discipline is the same. The [`ScriptChannel`] trait keeps the
-//! transport swappable — if the writeConfig round-trip misbehaves on real
-//! KWin, the zbus bridge from the vendored recipe drops in behind the same
-//! trait.
-//!
-//! [`WindowBackend`][pcu_core::backend::WindowBackend] ids are `u64`; KWin
-//! ids are strings, so they are mapped with FNV-1a (stable within a
-//! process; documented collision caveat).
-//!
-//! LIVE-VALIDATION (Arch machine):
-//! - the `writeConfig` → kwinrc group mapping (`[Script-<plugin>]`) is the
-//!   one unverified assumption here — if results never arrive, this is the
-//!   line to fix (or swap in the zbus bridge);
-//! - `qdbus`/`kreadconfig6` presence on a stock Plasma 6 session.
+//! [`ScriptChannel`] keeps the transport replaceable. Window IDs remain FNV-1a
+//! hashes of KWin's string IDs (with the existing hash-collision caveat).
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::Write;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+
+use dbus::blocking::Connection;
+use dbus::channel::{MatchingReceiver, Sender};
+use dbus::message::MatchRule;
 
 use pcu_core::backend::{WindowBackend, WindowInfo};
 use pcu_core::result::ExecError;
 
-/// Fixed config key the scripts write their result to. One key per channel
-/// (calls are `&mut`-serialized), so stale results can't accumulate.
-const RESULT_KEY: &str = "pcu_result";
-
-/// How long to wait for a script's `writeConfig` to become visible.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
+const CALLBACK_PATH: &str = "/org/pcu/ScriptResult";
+const CALLBACK_INTERFACE: &str = "org.pcu.ScriptResult";
 
-/// Runs a KWin script and returns what it wrote to [`RESULT_KEY`].
+/// Evaluate a script using `pcuReport(json)` to return a payload.
 ///
-/// `Ok(None)` = the script ran but wrote nothing (e.g. no active window);
-/// `Err` = the machinery failed (qdbus missing, timeout, ...).
+/// `Ok(None)` may represent no active window in alternate implementations.
+/// A missing callback or a script exception must be an error, not an empty
+/// desktop. The production channel returns `Some("null")` for no active window.
 pub trait ScriptChannel {
     fn eval(&mut self, script: &str) -> Result<Option<String>, ExecError>;
 }
@@ -59,44 +37,42 @@ pub trait ScriptChannel {
 // ---- JS script generators (adapted from wdotool's recipe) ---------------------
 
 fn list_windows_script() -> String {
-    format!(
-        r#"
-(function() {{
+    r#"
+(function() {
   var out = [];
   var list = (typeof workspace.windowList === "function")
     ? workspace.windowList()
     : workspace.clientList();
-  for (var i = 0; i < list.length; i++) {{
+  for (var i = 0; i < list.length; i++) {
     var w = list[i];
-    out.push({{
+    out.push({
       id: (w.internalId || w.windowId || i).toString(),
       title: String(w.caption || ""),
       app_id: String(w.resourceClass || w.resourceName || "")
-    }});
-  }}
-  writeConfig("{RESULT_KEY}", JSON.stringify(out));
-}})();
+    });
+  }
+  pcuReport(JSON.stringify(out));
+})();
 "#
-    )
+    .to_string()
 }
 
 fn active_window_script() -> String {
-    format!(
-        r#"
-(function() {{
+    r#"
+(function() {
   var w = workspace.activeWindow || workspace.activeClient;
   var payload = "null";
-  if (w) {{
-    payload = JSON.stringify({{
+  if (w) {
+    payload = JSON.stringify({
       id: (w.internalId || w.windowId || 0).toString(),
       title: String(w.caption || ""),
       app_id: String(w.resourceClass || w.resourceName || "")
-    }});
-  }}
-  writeConfig("{RESULT_KEY}", payload);
-}})();
+    });
+  }
+  pcuReport(payload);
+})();
 "#
-    )
+    .to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -118,117 +94,193 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-// ---- qdbus channel ---------------------------------------------------------------
+// ---- D-Bus callback channel -------------------------------------------------
 
-static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Blocking session-bus transport; no async runtime or persistent service.
+pub struct DbusChannel;
 
-/// [`ScriptChannel`] over the `qdbus` + `kreadconfig6` CLIs.
-pub struct QdbusChannel;
+/// Compatibility name for clients of the original CLI-based transport.
+pub use DbusChannel as QdbusChannel;
 
-impl QdbusChannel {
-    fn qdbus(args: &[&str]) -> Result<String, ExecError> {
-        let out = Command::new("qdbus").args(args).output().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ExecError::Infra("qdbus not found; is this a Plasma session?".into())
-            } else {
-                ExecError::Infra(format!("failed to run qdbus: {e}"))
-            }
-        })?;
-        if !out.status.success() {
-            return Err(ExecError::Infra(format!(
-                "qdbus {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+fn infra(stage: &str, error: impl std::fmt::Display) -> ExecError {
+    ExecError::Infra(format!("KWin {stage}: {error}"))
+}
+
+fn callback_rule(owner: String) -> MatchRule<'static> {
+    MatchRule::new_method_call()
+        .with_strict_sender(owner)
+        .with_path(CALLBACK_PATH)
+        .with_interface(CALLBACK_INTERFACE)
+        .with_member("Result")
+}
+
+fn callback_script(script: &str, destination: &str) -> String {
+    // A D-Bus unique name is safe, but serialize it anyway rather than relying
+    // on that when constructing JavaScript source.
+    let destination = serde_json::to_string(destination).unwrap();
+    format!(
+        r#"(function() {{
+  function report(ok, payload) {{
+    callDBus({destination}, "{CALLBACK_PATH}", "{CALLBACK_INTERFACE}", "Result", ok, payload);
+  }}
+  function pcuReport(payload) {{ report(true, payload); }}
+  try {{
+{script}
+  }} catch (error) {{
+    report(false, String(error));
+  }}
+}})();
+"#
+    )
+}
+
+trait ScriptControl {
+    fn load(&self, path: &str, plugin: &str) -> Result<i32, ExecError>;
+    fn run(&self, id: i32) -> Result<(), ExecError>;
+    fn unload(&self, plugin: &str) -> Result<(), ExecError>;
+}
+
+struct KWinControl<'a> {
+    connection: &'a Connection,
+    owner: String,
+}
+
+impl ScriptControl for KWinControl<'_> {
+    fn load(&self, path: &str, plugin: &str) -> Result<i32, ExecError> {
+        let (id,): (i32,) = self
+            .connection
+            .with_proxy(&*self.owner, "/Scripting", SCRIPT_TIMEOUT)
+            .method_call("org.kde.kwin.Scripting", "loadScript", (path, plugin))
+            .map_err(|e| infra("loadScript", e))?;
+        Ok(id)
     }
 
-    fn read_result(group: &str) -> Result<Option<String>, ExecError> {
-        let out = Command::new("kreadconfig6")
-            .args(["--file", "kwinrc", "--group", group, "--key", RESULT_KEY])
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ExecError::Infra("kreadconfig6 not found; is this a Plasma 6 session?".into())
-                } else {
-                    ExecError::Infra(format!("failed to run kreadconfig6: {e}"))
-                }
-            })?;
-        if !out.status.success() {
-            return Ok(None); // key not present (yet)
-        }
-        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(if v.is_empty() { None } else { Some(v) })
+    fn run(&self, id: i32) -> Result<(), ExecError> {
+        self.connection
+            .with_proxy(
+                &*self.owner,
+                format!("/Scripting/Script{id}"),
+                SCRIPT_TIMEOUT,
+            )
+            .method_call("org.kde.kwin.Script", "run", ())
+            .map_err(|e| infra("run", e))
+    }
+
+    fn unload(&self, plugin: &str) -> Result<(), ExecError> {
+        let (_removed,): (bool,) = self
+            .connection
+            .with_proxy(&*self.owner, "/Scripting", SCRIPT_TIMEOUT)
+            .method_call("org.kde.kwin.Scripting", "unloadScript", (plugin,))
+            .map_err(|e| infra("unloadScript", e))?;
+        Ok(())
     }
 }
 
-impl ScriptChannel for QdbusChannel {
+/// Always attempt unloading our unique plugin, even when load/run fails or
+/// times out (the remote operation might already have taken effect).
+fn run_script<T>(
+    control: &impl ScriptControl,
+    path: &str,
+    plugin: &str,
+    receive: impl FnOnce() -> Result<T, ExecError>,
+) -> Result<T, ExecError> {
+    let result = (|| {
+        let id = control.load(path, plugin)?;
+        if id < 0 {
+            return Err(ExecError::Backend(format!("KWin loadScript returned {id}")));
+        }
+        control.run(id)?;
+        receive()
+    })();
+    let cleanup = control.unload(plugin);
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(infra(
+            "query and cleanup failed",
+            format!("{error}; {cleanup}"),
+        )),
+    }
+}
+
+fn wait_result(
+    receiver: &Receiver<Result<String, ExecError>>,
+    timeout: Duration,
+    mut process: impl FnMut(Duration) -> Result<(), ExecError>,
+) -> Result<String, ExecError> {
+    let start = Instant::now();
+    loop {
+        match receiver.try_recv() {
+            Ok(result) => return result,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(infra("callback", "receiver disconnected"))
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(infra("callback", "timed out waiting for script result"));
+        }
+        process(remaining)?;
+    }
+}
+
+impl ScriptChannel for DbusChannel {
     fn eval(&mut self, script: &str) -> Result<Option<String>, ExecError> {
-        // Unique plugin name per call: KWin rejects loadScript when the
-        // name is already loaded.
-        let n = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let plugin = format!("pcu-{}-{n}", std::process::id());
-        let group = format!("[Script-{plugin}]");
+        let connection = Connection::new_session().map_err(|e| infra("session bus", e))?;
+        let (owner,): (String,) = connection
+            .with_proxy(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                SCRIPT_TIMEOUT,
+            )
+            .method_call("org.freedesktop.DBus", "GetNameOwner", ("org.kde.KWin",))
+            .map_err(|e| infra("service lookup", e))?;
+        let (sender, receiver) = mpsc::channel();
+        connection.start_receive(
+            callback_rule(owner.clone()),
+            Box::new(move |message, connection| {
+                let result = match message.read2::<bool, String>() {
+                    Ok((true, payload)) => Ok(payload),
+                    Ok((false, error)) => Err(ExecError::Backend(format!(
+                        "KWin script exception: {error}"
+                    ))),
+                    Err(error) => Err(infra("invalid callback", error)),
+                };
+                let reply = connection
+                    .send(message.method_return())
+                    .map_err(|_| infra("callback reply", "send failed"));
+                let _ = sender.send(reply.and(result));
+                false // one result per private connection
+            }),
+        );
 
-        let path: PathBuf =
-            std::env::temp_dir().join(format!("pcu-kwin-{}.js", plugin));
-        std::fs::write(&path, script)
-            .map_err(|e| ExecError::Infra(format!("cannot write KWin script temp file: {e}")))?;
-
-        let result = (|| -> Result<Option<String>, ExecError> {
-            let id_out = Self::qdbus(&[
-                "org.kde.KWin",
-                "/Scripting",
-                "org.kde.kwin.Scripting.loadScript",
-                path.to_str().ok_or_else(|| {
-                    ExecError::Infra("script temp path is not UTF-8".into())
-                })?,
-                &plugin,
-            ])?;
-            let script_id: i32 = id_out.parse().map_err(|_| {
-                ExecError::Backend(format!("loadScript returned non-integer: {id_out:?}"))
-            })?;
-            if script_id < 0 {
-                return Err(ExecError::Backend(format!(
-                    "loadScript failed (returned {script_id})"
-                )));
-            }
-            // Clear any stale result before running, so a leftover from a
-            // crashed earlier call can't be mistaken for this call's.
-            let _ = Self::read_result(&group);
-            Self::qdbus(&[
-                "org.kde.KWin",
-                &format!("/Scripting/Script{script_id}"),
-                "org.kde.kwin.Script.run",
-            ])?;
-
-            // Poll for the writeConfig result (same 3s discipline as
-            // wdotool's callback timeout).
-            let start = Instant::now();
-            let mut value = None;
-            while start.elapsed() < SCRIPT_TIMEOUT {
-                if let Some(v) = Self::read_result(&group)? {
-                    value = Some(v);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-
-            // Best-effort cleanup: unload from KWin; the temp file is
-            // removed by the outer scope. A stale loaded script is
-            // harmless (next call uses a fresh plugin name).
-            let _ = Self::qdbus(&[
-                "org.kde.KWin",
-                "/Scripting",
-                "org.kde.kwin.Scripting.unloadScript",
-                &plugin,
-            ]);
-            Ok(value)
-        })();
-
-        let _ = std::fs::remove_file(&path);
-        result
+        let mut file = tempfile::Builder::new()
+            .prefix("pcu-kwin-")
+            .suffix(".js")
+            .tempfile()
+            .map_err(|e| infra("temporary script", e))?;
+        file.write_all(callback_script(script, &connection.unique_name()).as_bytes())
+            .map_err(|e| infra("write script", e))?;
+        let path = file
+            .path()
+            .to_str()
+            .ok_or_else(|| infra("script path", "not UTF-8"))?;
+        let plugin = file.path().file_name().unwrap().to_str().unwrap();
+        let control = KWinControl {
+            connection: &connection,
+            owner,
+        };
+        // Keep the file alive until after unload: KWin reads scripts lazily.
+        run_script(&control, path, plugin, || {
+            wait_result(&receiver, SCRIPT_TIMEOUT, |remaining| {
+                connection
+                    .process(remaining)
+                    .map(|_| ())
+                    .map_err(|e| infra("callback dispatch", e))
+            })
+        })
+        .map(Some)
     }
 }
 
@@ -236,14 +288,14 @@ impl ScriptChannel for QdbusChannel {
 
 /// [`WindowBackend`] via KWin scripting. Generic over the [`ScriptChannel`]
 /// so tests can drive it with canned scripts/results.
-pub struct KWinWindows<C: ScriptChannel = QdbusChannel> {
+pub struct KWinWindows<C: ScriptChannel = DbusChannel> {
     channel: C,
 }
 
-impl KWinWindows<QdbusChannel> {
+impl KWinWindows<DbusChannel> {
     pub fn try_new() -> Self {
         Self {
-            channel: QdbusChannel,
+            channel: DbusChannel,
         }
     }
 }
@@ -287,13 +339,15 @@ impl<C: ScriptChannel> WindowBackend for KWinWindows<C> {
         let payload = self
             .channel
             .eval(&list_windows_script())?
-            .unwrap_or_else(|| "[]".to_string());
+            .ok_or_else(|| infra("window list", "script returned no payload"))?;
         let windows = Self::parse_list(&payload)?;
         // Mark the focused one: compare against the active window's id.
         let active_id = match self.channel.eval(&active_window_script())? {
-            Some(p) if p.trim() != "null" => serde_json::from_str::<ScriptWindow>(&p)
-                .ok()
-                .map(|w| w.id),
+            Some(p) if p.trim() != "null" => Some(
+                serde_json::from_str::<ScriptWindow>(&p)
+                    .map_err(|e| ExecError::Backend(format!("invalid active-window payload: {e}")))?
+                    .id,
+            ),
             _ => None,
         };
         Ok(windows
@@ -351,11 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn scripts_use_windowlist_clientlist_dual_and_writeconfig() {
+    fn scripts_use_windowlist_clientlist_dual_and_callback() {
         let s = list_windows_script();
         assert!(s.contains("windowList"));
         assert!(s.contains("clientList"));
-        assert!(s.contains(&format!("writeConfig(\"{RESULT_KEY}\"")));
+        assert!(s.contains("pcuReport(JSON.stringify(out))"));
         assert!(s.contains("JSON.stringify(out)"));
         assert!(s.contains("internalId || w.windowId"));
 
@@ -414,5 +468,167 @@ mod tests {
         let w: ScriptWindow = serde_json::from_str(r#"{"id":"7"}"#).unwrap();
         assert_eq!(w.title, "");
         assert_eq!(w.app_id, None);
+    }
+
+    #[test]
+    fn missing_list_payload_is_not_an_empty_desktop() {
+        let mut channel = FakeChannel::new();
+        channel.results.insert("list", None);
+        let error = KWinWindows::with_channel(channel)
+            .list_windows()
+            .unwrap_err();
+        assert!(matches!(error, ExecError::Infra(_)));
+    }
+
+    #[test]
+    fn malformed_focus_payload_is_not_silently_ignored() {
+        let mut channel = FakeChannel::new();
+        channel.results.insert("active", Some("broken".into()));
+        assert!(KWinWindows::with_channel(channel).list_windows().is_err());
+    }
+
+    #[test]
+    fn empty_desktop_and_no_focus_are_valid_explicit_results() {
+        let mut channel = FakeChannel::new();
+        channel.results.insert("list", Some("[]".into()));
+        channel.results.insert("active", Some("null".into()));
+        assert!(KWinWindows::with_channel(channel)
+            .list_windows()
+            .unwrap()
+            .is_empty());
+    }
+
+    struct FakeControl {
+        calls: RefCell<Vec<&'static str>>,
+        fail: &'static str,
+    }
+
+    impl ScriptControl for FakeControl {
+        fn load(&self, _path: &str, _plugin: &str) -> Result<i32, ExecError> {
+            self.calls.borrow_mut().push("load");
+            match self.fail {
+                "load" => Err(infra("load", "failed")),
+                "negative" => Ok(-1),
+                _ => Ok(7),
+            }
+        }
+        fn run(&self, id: i32) -> Result<(), ExecError> {
+            assert_eq!(id, 7);
+            self.calls.borrow_mut().push("run");
+            if self.fail == "run" {
+                Err(infra("run", "failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn unload(&self, _plugin: &str) -> Result<(), ExecError> {
+            self.calls.borrow_mut().push("unload");
+            if self.fail == "unload" {
+                Err(infra("unload", "failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_runs_after_load_run_and_callback_failures() {
+        for fail in ["none", "load", "negative", "run", "receive", "unload"] {
+            let control = FakeControl {
+                calls: RefCell::new(vec![]),
+                fail,
+            };
+            let result = run_script(&control, "script.js", "unique-plugin", || {
+                control.calls.borrow_mut().push("receive");
+                if fail == "receive" {
+                    Err(infra("callback", "timed out"))
+                } else {
+                    Ok("[]")
+                }
+            });
+            assert_eq!(result.is_ok(), fail == "none", "{fail}");
+            let expected = match fail {
+                "load" | "negative" => vec!["load", "unload"],
+                "run" => vec!["load", "run", "unload"],
+                _ => vec!["load", "run", "receive", "unload"],
+            };
+            assert_eq!(*control.calls.borrow(), expected, "{fail}");
+        }
+    }
+
+    #[test]
+    fn callback_timeout_is_an_infrastructure_error() {
+        let (_sender, receiver) = mpsc::channel();
+        let result = wait_result(&receiver, Duration::ZERO, |_| {
+            panic!("deadline already passed")
+        });
+        assert!(matches!(result, Err(ExecError::Infra(message)) if message.contains("timed out")));
+    }
+
+    #[test]
+    fn callback_dispatch_preserves_payload_and_script_errors() {
+        for payload in [
+            Ok("héllo 🐺".to_string()),
+            Err(ExecError::Backend("script error".into())),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            let result = wait_result(&receiver, SCRIPT_TIMEOUT, |_| {
+                sender.send(payload.clone()).unwrap();
+                Ok(())
+            });
+            assert_eq!(result, payload);
+        }
+    }
+
+    #[test]
+    fn callback_dispatch_failure_is_reported() {
+        let (_sender, receiver) = mpsc::channel();
+        let error = infra("dispatch", "bus disconnected");
+        assert_eq!(
+            wait_result(&receiver, SCRIPT_TIMEOUT, |_| Err(error.clone())),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn callback_only_accepts_the_pinned_kwin_owner_and_endpoint() {
+        let rule = callback_rule(":1.42".into());
+        for (sender, path, interface, member, accepted) in [
+            (
+                Some(":1.42"),
+                CALLBACK_PATH,
+                CALLBACK_INTERFACE,
+                "Result",
+                true,
+            ),
+            (
+                Some(":1.43"),
+                CALLBACK_PATH,
+                CALLBACK_INTERFACE,
+                "Result",
+                false,
+            ),
+            (None, CALLBACK_PATH, CALLBACK_INTERFACE, "Result", false),
+            (Some(":1.42"), "/wrong", CALLBACK_INTERFACE, "Result", false),
+            (
+                Some(":1.42"),
+                CALLBACK_PATH,
+                "org.pcu.Wrong",
+                "Result",
+                false,
+            ),
+            (
+                Some(":1.42"),
+                CALLBACK_PATH,
+                CALLBACK_INTERFACE,
+                "Wrong",
+                false,
+            ),
+        ] {
+            let mut message =
+                dbus::Message::new_method_call(":1.99", path, interface, member).unwrap();
+            message.set_sender(sender.map(Into::into));
+            assert_eq!(rule.matches(&message), accepted);
+        }
     }
 }
