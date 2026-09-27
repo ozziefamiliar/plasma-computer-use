@@ -49,6 +49,11 @@ pub struct Policy {
     pub confirm_text_fragments: Vec<String>,
     /// `Wait` longer than this is denied (sleep-bomb guard).
     pub max_wait_ms: u64,
+    /// Read-only mode: only observation actions (currently `Screenshot`;
+    /// window-listing actions join the allowlist when they exist) run.
+    /// Everything else is denied in place with a model-facing reason.
+    /// Useful for recon/observation sessions where nothing may be touched.
+    pub read_only: bool,
 }
 
 impl Default for Policy {
@@ -71,6 +76,7 @@ impl Default for Policy {
                 "poweroff".into(),
             ],
             max_wait_ms: 60_000,
+            read_only: false,
         }
     }
 }
@@ -82,8 +88,33 @@ fn normalize_combo(keys: &[String]) -> Vec<String> {
     v
 }
 
+/// The model-facing action tag, matching the serde wire names.
+fn action_tag(action: &Action) -> &'static str {
+    match action {
+        Action::Screenshot { .. } => "screenshot",
+        Action::Move { .. } => "move",
+        Action::Click { .. } => "click",
+        Action::DoubleClick { .. } => "double_click",
+        Action::Drag { .. } => "drag",
+        Action::Scroll { .. } => "scroll",
+        Action::Keypress { .. } => "keypress",
+        Action::Type { .. } => "type",
+        Action::Wait { .. } => "wait",
+    }
+}
+
 /// Review one action against the policy.
 pub fn review(policy: &Policy, action: &Action) -> Verdict {
+    // Read-only runs before any other check: observation only, and the
+    // reason names the refused action so the model can adjust its plan.
+    if policy.read_only && !matches!(action, Action::Screenshot { .. }) {
+        return Verdict::Deny {
+            reason: format!(
+                "read-only policy denies {}: only screenshot actions are allowed",
+                action_tag(action)
+            ),
+        };
+    }
     match action {
         Action::Keypress { keys } => {
             let combo = normalize_combo(keys);
@@ -305,6 +336,80 @@ mod tests {
             review(&p, &keypress(&["super", "l"])),
             Verdict::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn read_only_allows_only_screenshots() {
+        let p = Policy {
+            read_only: true,
+            ..Policy::default()
+        };
+        // Screenshots are the observation primitive: allowed.
+        assert!(review(&p, &Action::Screenshot { note: None }).allowed());
+        // Everything else is denied, with a reason naming the action so
+        // the model can replan.
+        let others = Batch(vec![
+            Action::Move { frame: FrameId(1), x: 0, y: 0 },
+            Action::Click {
+                frame: FrameId(1),
+                button: MouseButton::Left,
+                x: 0,
+                y: 0,
+            },
+            Action::DoubleClick {
+                frame: FrameId(1),
+                button: MouseButton::Right,
+                x: 0,
+                y: 0,
+            },
+            Action::Drag {
+                frame: FrameId(1),
+                path: vec![],
+            },
+            Action::Scroll {
+                frame: FrameId(1),
+                x: 0,
+                y: 0,
+                dx: 0.0,
+                dy: 1.0,
+            },
+            keypress(&["ctrl", "l"]),
+            Action::Type { text: "hello".into() },
+            Action::Wait { ms: 100 },
+        ]);
+        let verdicts = review_batch(&p, &others);
+        assert_eq!(verdicts.len(), 8);
+        assert!(verdicts.iter().all(|v| matches!(v, Verdict::Deny { .. })));
+        for (a, v) in others.0.iter().zip(verdicts) {
+            if let Verdict::Deny { reason } = v {
+                assert!(
+                    reason.contains(action_tag(a)),
+                    "reason {reason:?} should name the refused action"
+                );
+            }
+        }
+        // A batch made only of screenshots sails through.
+        let shots = Batch(vec![
+            Action::Screenshot { note: Some("recon".into()) },
+            Action::Screenshot { note: None },
+        ]);
+        assert!(review_batch(&p, &shots).iter().all(|v| v.allowed()));
+    }
+
+    #[test]
+    fn read_only_still_bounds_batch_length() {
+        let p = Policy {
+            read_only: true,
+            max_batch_len: 1,
+            ..Policy::default()
+        };
+        let batch = Batch(vec![
+            Action::Screenshot { note: None },
+            Action::Screenshot { note: None },
+        ]);
+        assert!(review_batch(&p, &batch)
+            .iter()
+            .all(|v| matches!(v, Verdict::Deny { .. })));
     }
 
     #[test]

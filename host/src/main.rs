@@ -17,6 +17,11 @@
 //!
 //! `--doctor` prints a JSON readiness report (the session-#1 "doctor-style
 //! readiness JSON") and exits 0/1 without starting the server.
+//!
+//! `--debug` logs one JSON line per `tools/call` batch to stderr: request
+//! id, backend type names, requested actions verbatim, elapsed wall time,
+//! and the full MCP result (per-action statuses with mapped desktop
+//! coordinates, screenshot frame ids + dims, failure messages).
 
 use pcu_backends::spectacle::{GeometryProbe, KScreenDoctor, LogicalMonitor, SpectacleCapture};
 use pcu_backends::uinput::UInputBackend;
@@ -139,18 +144,24 @@ fn which(bin: &str) -> Option<String> {
 fn usage() {
     println!(
         "pcu-host: JSON-RPC 2.0 stdio server with real Plasma 6 backends.\n\n\
-         Usage: pcu-host [--mime <type>] [--doctor]\n\n\
+         Usage: pcu-host [--mime <type>] [--doctor] [--debug] [--read-only]\n\n\
          Reads line-delimited JSON-RPC requests on stdin, writes responses on\n\
          stdout. --mime names the screenshot content type (default image/png,\n\
          since spectacle emits PNG). --doctor probes uinput, the desktop\n\
          geometry, spectacle and KWin window queries, prints a JSON readiness report, and\n\
-         exits without serving."
+         exits without serving. --debug logs one JSON line per tools/call\n\
+         batch to stderr (request id, backends, requested actions, elapsed\n\
+         ms, per-action outcomes with frame ids/dims/mapped coords/failures).\n\
+         --read-only flips the guard to observation mode: only screenshot\n\
+         actions run, everything else is denied in place."
     );
 }
 
 fn main() -> io::Result<()> {
     let mut mime = "image/png".to_string();
     let mut doctor_only = false;
+    let mut debug = false;
+    let mut read_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -161,6 +172,8 @@ fn main() -> io::Result<()> {
                 });
             }
             "--doctor" => doctor_only = true,
+            "--debug" => debug = true,
+            "--read-only" => read_only = true,
             "--help" | "-h" => {
                 usage();
                 return Ok(());
@@ -191,7 +204,7 @@ fn main() -> io::Result<()> {
         geo.width, geo.height, geo.min_x, geo.min_y
     );
 
-    let exec = Executor::new(
+    let mut exec = Executor::new(
         capture,
         input,
         windows,
@@ -199,7 +212,15 @@ fn main() -> io::Result<()> {
         Timing::default(),
         geo,
     );
+    if read_only {
+        eprintln!("pcu-host: --read-only on: only screenshot actions will run");
+        exec.set_read_only(true);
+    }
     let mut server = Server::new(exec, mime);
+    if debug {
+        eprintln!("pcu-host: --debug on, batch log goes to stderr");
+        server = server.with_debug(io::stderr());
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();

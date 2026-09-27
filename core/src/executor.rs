@@ -148,6 +148,13 @@ where
         self.policy = policy;
     }
 
+    /// Flip read-only mode without rebuilding the policy: only `Screenshot`
+    /// actions run; every other action fails in place with a guard error.
+    /// Convenient for hosts wiring a `--read-only` flag.
+    pub fn set_read_only(&mut self, on: bool) {
+        self.policy.read_only = on;
+    }
+
     /// The full self-describing payload for a frame (MCP adapter's view).
     pub fn describe_frame(&self, id: FrameId) -> Option<ScreenshotDesc> {
         self.registry.lookup(id).map(|space| {
@@ -751,6 +758,50 @@ mod tests {
             }
         ));
         assert!(ex.input().log.is_empty());
+    }
+
+    #[test]
+    fn read_only_blocks_input_but_screenshots_still_register_frames() {
+        let mut ex = executor();
+        ex.set_read_only(true);
+        // Screenshots sail through and register frames as usual.
+        let r = ex.execute(&screenshot_batch());
+        assert!(r.all_ok());
+        assert_eq!(r.new_frames, vec![FrameId(1)]);
+        // Input actions are denied in place with guard errors — even on a
+        // *valid* frame, so the guard verdict demonstrably fires before any
+        // mapping or backend work — and the batch keeps going past them.
+        let r = ex.execute(&Batch(vec![
+            Action::Click {
+                frame: FrameId(1),
+                button: MouseButton::Left,
+                x: 10,
+                y: 10,
+            },
+            Action::Type {
+                text: "hello".into(),
+            },
+            Action::Wait { ms: 50 },
+        ]));
+        assert_eq!(r.outcomes.len(), 3);
+        assert!(r.outcomes.iter().all(|o| matches!(
+            o,
+            ActionOutcome::Failed {
+                error: ExecError::Guard(_)
+            }
+        )));
+        assert!(!r.all_ok());
+        assert!(ex.input().log.is_empty()); // backends never consulted
+        // Toggling back off restores full execution.
+        ex.set_read_only(false);
+        let r = ex.execute(&Batch(vec![Action::Click {
+            frame: FrameId(1),
+            button: MouseButton::Left,
+            x: 10,
+            y: 10,
+        }]));
+        assert!(r.all_ok());
+        assert_eq!(ex.input().log.len(), 3); // move + press + release
     }
 
     #[test]
