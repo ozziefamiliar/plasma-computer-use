@@ -207,6 +207,12 @@ mod tests {
         assert_eq!(focus, Action::FocusWindow { id: WindowId(12345) });
         let bounds: Action = serde_json::from_str(r#"{"type":"window_bounds","id":7}"#).unwrap();
         assert_eq!(bounds, Action::WindowBounds { id: WindowId(7) });
+        // WindowId is transparent: the wire shape stays a plain number,
+        // so the MCP schema and debug log are byte-identical.
+        assert_eq!(
+            serde_json::to_value(&Action::FocusWindow { id: WindowId(12345) }).unwrap()["id"],
+            12345
+        );
         let active: Action = serde_json::from_str(r#"{"type":"active_window"}"#).unwrap();
         assert_eq!(active, Action::ActiveWindow);
         // Wire names are snake_case, matching the MCP schema's consts.
