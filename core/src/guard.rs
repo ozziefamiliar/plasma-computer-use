@@ -317,6 +317,7 @@ pub fn review_batch(policy: &Policy, batch: &Batch) -> Vec<Verdict> {
 mod tests {
     use super::*;
     use crate::action::MouseButton;
+    use crate::backend::WindowId;
     use crate::frame::FrameId;
 
     fn keypress(keys: &[&str]) -> Action {
@@ -465,7 +466,7 @@ mod tests {
                 app_id: None,
             },
             Action::ActiveWindow,
-            Action::WindowBounds { id: 1 },
+            Action::WindowBounds { id: WindowId(1) },
         ] {
             assert!(review(&p, &a).allowed(), "{a:?} should be read-only-safe");
         }
@@ -499,7 +500,7 @@ mod tests {
             keypress(&["ctrl", "l"]),
             Action::Type { text: "hello".into() },
             Action::Wait { ms: 100 },
-            Action::FocusWindow { id: 1 },
+            Action::FocusWindow { id: WindowId(1) },
         ]);
         let verdicts = review_batch(&p, &others);
         assert_eq!(verdicts.len(), 9);

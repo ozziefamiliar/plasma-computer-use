@@ -62,11 +62,21 @@ pub trait InputBackend {
     }
 }
 
+/// Opaque handle for a backend window. Distinct from [`FrameId`] by
+/// construction: a window id is not a frame id and the type system says
+/// so. `#[serde(transparent)]` keeps the wire shape a plain JSON number,
+/// so the MCP schema and the debug log are byte-identical.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct WindowId(pub u64);
+
 /// Describes one top-level window. `Serialize` so transports (MCP, debug
 /// log) can hand the model the exact shape it acted on.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WindowInfo {
-    pub id: u64,
+    pub id: WindowId,
     pub title: String,
     pub app_id: String,
     pub focused: bool,
@@ -100,7 +110,7 @@ pub struct WindowQuery {
     /// Exact match against the application id.
     pub app_id: Option<String>,
     /// Exact match against the backend window id.
-    pub id: Option<u64>,
+    pub id: Option<WindowId>,
 }
 
 impl WindowQuery {
@@ -134,7 +144,7 @@ pub trait WindowBackend {
     /// no window with that id exists; `true` means the request was issued
     /// (focus itself is asynchronous on the compositor — a subsequent
     /// `active_window` read is the confirmation).
-    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError>;
+    fn focus_window(&mut self, id: WindowId) -> Result<bool, ExecError>;
     /// Windows matching `query`, newest/most-recently-used first if the
     /// backend orders them that way. The default implementation filters
     /// `list_windows`; backends with a cheaper native query can override.
@@ -149,7 +159,7 @@ pub trait WindowBackend {
     /// exist (or when the backend doesn't report bounds). The default
     /// implementation reads `list_windows`; backends with a cheaper
     /// single-window query can override.
-    fn window_bounds(&mut self, id: u64) -> Result<Option<WindowBounds>, ExecError> {
+    fn window_bounds(&mut self, id: WindowId) -> Result<Option<WindowBounds>, ExecError> {
         Ok(self
             .list_windows()?
             .into_iter()
@@ -304,7 +314,7 @@ impl WindowBackend for MockWindow {
         Ok(self.windows.clone())
     }
 
-    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError> {
+    fn focus_window(&mut self, id: WindowId) -> Result<bool, ExecError> {
         if !self.windows.iter().any(|w| w.id == id) {
             return Ok(false);
         }
@@ -361,28 +371,28 @@ mod tests {
     fn mock_window_reports_focused() {
         let mut w = MockWindow::new(vec![
             WindowInfo {
-                id: 1,
+                id: WindowId(1),
                 title: "a".into(),
                 app_id: "x".into(),
                 focused: false,
                 bounds: None,
             },
             WindowInfo {
-                id: 2,
+                id: WindowId(2),
                 title: "b".into(),
                 app_id: "y".into(),
                 focused: true,
                 bounds: None,
             },
         ]);
-        assert_eq!(w.active_window().unwrap().unwrap().id, 2);
+        assert_eq!(w.active_window().unwrap().unwrap().id, WindowId(2));
         assert_eq!(w.list_windows().unwrap().len(), 2);
     }
 
     fn window_list() -> Vec<WindowInfo> {
         vec![
             WindowInfo {
-                id: 1,
+                id: WindowId(1),
                 title: "Konsole — root".into(),
                 app_id: "org.kde.konsole".into(),
                 focused: false,
@@ -394,7 +404,7 @@ mod tests {
                 }),
             },
             WindowInfo {
-                id: 2,
+                id: WindowId(2),
                 title: "Mozilla Firefox".into(),
                 app_id: "firefox".into(),
                 focused: true,
@@ -411,11 +421,11 @@ mod tests {
     #[test]
     fn focus_window_flips_focus_and_reports_unknown() {
         let mut w = MockWindow::new(window_list());
-        assert!(w.focus_window(1).unwrap());
-        assert_eq!(w.active_window().unwrap().unwrap().id, 1);
-        assert!(!w.focus_window(99).unwrap());
+        assert!(w.focus_window(WindowId(1)).unwrap());
+        assert_eq!(w.active_window().unwrap().unwrap().id, WindowId(1));
+        assert!(!w.focus_window(WindowId(99)).unwrap());
         // unknown id leaves the current focus untouched
-        assert_eq!(w.active_window().unwrap().unwrap().id, 1);
+        assert_eq!(w.active_window().unwrap().unwrap().id, WindowId(1));
     }
 
     #[test]
@@ -427,7 +437,7 @@ mod tests {
         };
         let hits = w.find_window(&q).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[0].id, WindowId(2));
 
         let q = WindowQuery {
             app_id: Some("org.kde.konsole".into()),
@@ -445,7 +455,7 @@ mod tests {
         assert_eq!(w.find_window(&WindowQuery::default()).unwrap().len(), 2);
 
         let q = WindowQuery {
-            id: Some(2),
+            id: Some(WindowId(2)),
             ..Default::default()
         };
         assert_eq!(w.find_window(&q).unwrap().len(), 1);
@@ -454,11 +464,11 @@ mod tests {
     #[test]
     fn window_bounds_reads_list_entry() {
         let mut w = MockWindow::new(window_list());
-        let b = w.window_bounds(2).unwrap().unwrap();
+        let b = w.window_bounds(WindowId(2)).unwrap().unwrap();
         assert_eq!(b.w, 1120.0);
         assert!(b.contains(900.0, 100.0));
         assert!(!b.contains(799.9, 100.0));
-        assert!(w.window_bounds(99).unwrap().is_none());
+        assert!(w.window_bounds(WindowId(99)).unwrap().is_none());
     }
 
     #[test]

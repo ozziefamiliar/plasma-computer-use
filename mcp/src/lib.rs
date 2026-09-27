@@ -575,12 +575,12 @@ mod tests {
     }
 
     fn windowed_executor() -> Executor<MockCapture, MockInput, MockWindow, MockClock> {
-        use pcu_core::{WindowBounds, WindowInfo};
+        use pcu_core::{WindowBounds, WindowId, WindowInfo};
         Executor::new(
             MockCapture::new(identity_space()),
             MockInput::new(),
             MockWindow::new(vec![WindowInfo {
-                id: 7,
+                id: WindowId(7),
                 title: "Konsole".into(),
                 app_id: "org.kde.konsole".into(),
                 focused: true,

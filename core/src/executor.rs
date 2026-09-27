@@ -883,7 +883,7 @@ fn interpolate(path: &[UInputAbs], total: u32) -> Vec<UInputAbs> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{InputOp, MockCapture, MockInput, MockWindow, WindowBounds, WindowInfo};
+    use crate::backend::{InputOp, MockCapture, MockInput, MockWindow, WindowBounds, WindowId, WindowInfo};
     use crate::guard::Policy;
 
     fn identity_space() -> CoordSpace {
@@ -1705,7 +1705,7 @@ mod tests {
     fn windowed_executor() -> Executor<MockCapture, MockInput, MockWindow, MockClock> {
         let windows = vec![
             WindowInfo {
-                id: 101,
+                id: WindowId(101),
                 title: "Terminal - zsh".into(),
                 app_id: "org.kde.konsole".into(),
                 focused: true,
@@ -1717,7 +1717,7 @@ mod tests {
                 }),
             },
             WindowInfo {
-                id: 202,
+                id: WindowId(202),
                 title: "Firefox".into(),
                 app_id: "org.mozilla.firefox".into(),
                 focused: false,
@@ -1770,7 +1770,7 @@ mod tests {
         }]));
         let (windows, _) = windows_outcome(&r);
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].id, 202);
+        assert_eq!(windows[0].id, WindowId(202));
     }
 
     #[test]
@@ -1782,7 +1782,7 @@ mod tests {
         }]));
         let (windows, _) = windows_outcome(&r);
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].id, 101);
+        assert_eq!(windows[0].id, WindowId(101));
     }
 
     #[test]
@@ -1791,39 +1791,39 @@ mod tests {
         let r = ex.execute(&Batch(vec![Action::ActiveWindow]));
         let (windows, _) = windows_outcome(&r);
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].id, 101);
+        assert_eq!(windows[0].id, WindowId(101));
     }
 
     #[test]
     fn focus_window_flips_focus_and_reports_success() {
         let mut ex = windowed_executor();
-        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: 202 }]));
+        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: WindowId(202) }]));
         let (windows, focused) = windows_outcome(&r);
         assert_eq!(focused, Some(true));
         assert!(windows.is_empty());
         // The backend state actually flipped: active_window follows.
         let r = ex.execute(&Batch(vec![Action::ActiveWindow]));
         let (windows, _) = windows_outcome(&r);
-        assert_eq!(windows[0].id, 202);
+        assert_eq!(windows[0].id, WindowId(202));
     }
 
     #[test]
     fn focus_window_unknown_id_reports_false_without_touching_state() {
         let mut ex = windowed_executor();
-        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: 999 }]));
+        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: WindowId(999) }]));
         let (windows, focused) = windows_outcome(&r);
         assert_eq!(focused, Some(false));
         assert!(windows.is_empty());
         // Nothing was touched: the previously focused window is still active.
         let r = ex.execute(&Batch(vec![Action::ActiveWindow]));
         let (windows, _) = windows_outcome(&r);
-        assert_eq!(windows[0].id, 101);
+        assert_eq!(windows[0].id, WindowId(101));
     }
 
     #[test]
     fn window_bounds_returns_one_element_list_with_geometry() {
         let mut ex = windowed_executor();
-        let r = ex.execute(&Batch(vec![Action::WindowBounds { id: 202 }]));
+        let r = ex.execute(&Batch(vec![Action::WindowBounds { id: WindowId(202) }]));
         let (windows, focused) = windows_outcome(&r);
         assert_eq!(focused, None);
         assert_eq!(windows.len(), 1);
@@ -1837,7 +1837,7 @@ mod tests {
             })
         );
         // Unknown id: empty list, still ok.
-        let r = ex.execute(&Batch(vec![Action::WindowBounds { id: 999 }]));
+        let r = ex.execute(&Batch(vec![Action::WindowBounds { id: WindowId(999) }]));
         let (windows, _) = windows_outcome(&r);
         assert!(windows.is_empty());
     }
@@ -1853,11 +1853,11 @@ mod tests {
                 app_id: None,
             },
             Action::ActiveWindow,
-            Action::WindowBounds { id: 101 },
+            Action::WindowBounds { id: WindowId(101) },
         ]));
         assert!(r.all_ok());
         // ...but focus_window is a state change: denied in place.
-        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: 202 }]));
+        let r = ex.execute(&Batch(vec![Action::FocusWindow { id: WindowId(202) }]));
         assert!(matches!(
             &r.outcomes[0],
             ActionOutcome::Failed {

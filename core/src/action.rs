@@ -5,6 +5,7 @@
 //! the executor against the [`FrameRegistry`](crate::frame::FrameRegistry).
 //! Nothing MCP-specific leaks in here.
 
+use crate::backend::WindowId;
 use crate::coord::PxPoint;
 use crate::frame::FrameId;
 use serde::{Deserialize, Serialize};
@@ -109,13 +110,13 @@ pub enum Action {
     /// `active_window` result). Reports whether the backend knew the id;
     /// `false` means nothing was touched. State-changing — denied under
     /// the read-only policy.
-    FocusWindow { id: u64 },
+    FocusWindow { id: WindowId },
 
     /// Bounds (frame geometry, desktop logical pixels) of the window with
     /// this backend id, reported as a one-element window list. Empty list
     /// means the backend didn't know the id. Observation only — allowed
     /// under the read-only policy.
-    WindowBounds { id: u64 },
+    WindowBounds { id: WindowId },
 }
 
 impl Action {
@@ -203,9 +204,9 @@ mod tests {
             }
         );
         let focus: Action = serde_json::from_str(r#"{"type":"focus_window","id":12345}"#).unwrap();
-        assert_eq!(focus, Action::FocusWindow { id: 12345 });
+        assert_eq!(focus, Action::FocusWindow { id: WindowId(12345) });
         let bounds: Action = serde_json::from_str(r#"{"type":"window_bounds","id":7}"#).unwrap();
-        assert_eq!(bounds, Action::WindowBounds { id: 7 });
+        assert_eq!(bounds, Action::WindowBounds { id: WindowId(7) });
         let active: Action = serde_json::from_str(r#"{"type":"active_window"}"#).unwrap();
         assert_eq!(active, Action::ActiveWindow);
         // Wire names are snake_case, matching the MCP schema's consts.
@@ -238,6 +239,6 @@ mod tests {
         // Window actions carry no frame: no coordinate mapping, no frame
         // review in the guard.
         assert_eq!(Action::ActiveWindow.frame(), None);
-        assert_eq!(Action::FocusWindow { id: 1 }.frame(), None);
+        assert_eq!(Action::FocusWindow { id: WindowId(1) }.frame(), None);
     }
 }

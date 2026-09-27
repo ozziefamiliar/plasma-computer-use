@@ -41,7 +41,7 @@ pub mod result;
 pub use action::{Action, Batch, MouseButton};
 pub use backend::{
     CapturedFrame, CaptureBackend, InputBackend, InputOp, MockCapture, MockInput, MockWindow,
-    WindowBackend, WindowBounds, WindowInfo, WindowQuery,
+    WindowBackend, WindowBounds, WindowId, WindowInfo, WindowQuery,
 };
 pub use coord::{DesktopPoint, MapError, PxPoint, UInputAbs, map_desktop_to_uinput, map_px_to_desktop};
 pub use executor::{CancelHandle, Clock, Executor, MockClock, RealClock, Timing};

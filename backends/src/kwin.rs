@@ -18,7 +18,7 @@ use dbus::blocking::Connection;
 use dbus::channel::{MatchingReceiver, Sender};
 use dbus::message::MatchRule;
 
-use pcu_core::backend::{WindowBackend, WindowInfo};
+use pcu_core::backend::{WindowBackend, WindowId, WindowInfo};
 use pcu_core::result::ExecError;
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -357,7 +357,7 @@ impl<C: ScriptChannel> KWinWindows<C> {
 
     fn to_info(w: ScriptWindow, focused: bool) -> WindowInfo {
         WindowInfo {
-            id: fnv1a(&w.id),
+            id: WindowId(fnv1a(&w.id)),
             title: w.title,
             app_id: w.app_id.unwrap_or_default(),
             focused,
@@ -415,7 +415,7 @@ impl<C: ScriptChannel> WindowBackend for KWinWindows<C> {
             .collect())
     }
 
-    fn focus_window(&mut self, id: u64) -> Result<bool, ExecError> {
+    fn focus_window(&mut self, id: WindowId) -> Result<bool, ExecError> {
         // The trait's ids are FNV-1a hashes of KWin's string ids, which are
         // not invertible — so list first to recover the string id, then run
         // the targeted activate script (wdotool's `workspace.activeWindow =
@@ -427,7 +427,7 @@ impl<C: ScriptChannel> WindowBackend for KWinWindows<C> {
             .unwrap_or_else(|| "[]".to_string());
         let target = Self::parse_list(&payload)?
             .into_iter()
-            .find(|w| fnv1a(&w.id) == id);
+            .find(|w| fnv1a(&w.id) == id.0);
         let Some(target) = target else {
             return Ok(false);
         };
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(wins[1].app_id, "firefox");
         // ids are stable string hashes, distinct per window
         assert_ne!(wins[0].id, wins[1].id);
-        assert_eq!(wins[0].id, fnv1a("11"));
+        assert_eq!(wins[0].id, WindowId(fnv1a("11")));
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
     fn focus_window_activates_known_id() {
         let ch = FakeChannel::new();
         let mut b = KWinWindows::with_channel(ch);
-        assert!(b.focus_window(fnv1a("22")).unwrap());
+        assert!(b.focus_window(WindowId(fnv1a("22"))).unwrap());
         let seen = b.channel.seen_scripts.borrow();
         let activate: Vec<_> = seen
             .iter()
@@ -563,7 +563,7 @@ mod tests {
     fn focus_window_false_for_unknown_id() {
         let ch = FakeChannel::new();
         let mut b = KWinWindows::with_channel(ch);
-        assert!(!b.focus_window(fnv1a("nope")).unwrap());
+        assert!(!b.focus_window(WindowId(fnv1a("nope"))).unwrap());
         // unknown id: no activate script ever ran
         assert!(!b
             .channel
@@ -579,7 +579,7 @@ mod tests {
         ch.results.insert("activate", Some("false".to_string()));
         let mut b = KWinWindows::with_channel(ch);
         // id exists in the list, but the script says it didn't find it
-        assert!(!b.focus_window(fnv1a("11")).unwrap());
+        assert!(!b.focus_window(WindowId(fnv1a("11"))).unwrap());
     }
 
     #[test]
