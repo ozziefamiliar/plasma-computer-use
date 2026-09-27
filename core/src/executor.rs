@@ -26,6 +26,10 @@ use crate::coord::{
 use crate::frame::{CoordSpace, DesktopGeometry, FrameId, FrameRegistry, ScreenshotDesc, MAX_FRAMES};
 use crate::result::{ActionOutcome, BatchResult, ExecError};
 use std::collections::VecDeque;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 /// Where the executor sleeps. [`MockClock`] records; [`RealClock`] waits.
@@ -97,6 +101,44 @@ impl Default for Timing {
     }
 }
 
+/// A thread-safe handle for emergency cancellation.
+///
+/// Cloned freely and handed to whoever needs to stop the executor: the
+/// stdio router's `notifications/cancelled` handler, a signal handler, a
+/// watchdog thread. The flag takes effect at the next *action boundary* —
+/// the currently executing action (e.g. a 24-step drag) runs to completion,
+/// then every remaining action in the batch drains as
+/// [`ExecError::Cancelled`] without touching backends. The flag is
+/// one-shot: the first `execute()` that observes it clears it, so a stale
+/// cancel can never poison a later batch.
+///
+/// Mid-*batch* cancellation over the current single-threaded stdio loop is
+/// limited by the transport: `execute()` blocks, so a cancel line can't be
+/// read until the batch finishes. The flag takes effect at the first
+/// action boundary of the *next* batch. A host that runs `execute()` on a
+/// worker thread gets true mid-batch cancellation for free.
+#[derive(Debug, Clone)]
+pub struct CancelHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelHandle {
+    /// Arm cancellation: the next action boundary drains the batch.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm without executing: drop a stale cancel.
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation is currently armed.
+    pub fn is_armed(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
 /// Runs batches against concrete backends.
 pub struct Executor<C, I, W, K> {
     capture: C,
@@ -113,6 +155,9 @@ pub struct Executor<C, I, W, K> {
     screenshot_bytes: VecDeque<(FrameId, Vec<u8>)>,
     /// Safety policy applied to every batch before execution.
     policy: crate::guard::Policy,
+    /// Emergency-cancel flag; shared by clone with whoever holds a
+    /// [`CancelHandle`].
+    cancel: Arc<AtomicBool>,
 }
 
 impl<C, I, W, K> Executor<C, I, W, K>
@@ -140,6 +185,7 @@ where
             geometry,
             screenshot_bytes: VecDeque::new(),
             policy: crate::guard::Policy::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -153,6 +199,25 @@ where
     /// Convenient for hosts wiring a `--read-only` flag.
     pub fn set_read_only(&mut self, on: bool) {
         self.policy.read_only = on;
+    }
+
+    /// A cloneable handle that arms emergency cancellation (see
+    /// [`CancelHandle`]).
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            flag: Arc::clone(&self.cancel),
+        }
+    }
+
+    /// Arm emergency cancellation directly (host shorthand for
+    /// `cancel_handle().cancel()`).
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation is currently armed.
+    pub fn cancel_armed(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     /// The full self-describing payload for a frame (MCP adapter's view).
@@ -192,10 +257,30 @@ where
     /// Execute a batch; outcomes are parallel to the input actions.
     /// The safety policy is reviewed first: denied or unconfirmed actions
     /// fail in place without aborting the batch.
+    ///
+    /// Emergency cancellation is checked at every action boundary: if the
+    /// cancel flag is armed, the current and all remaining actions drain as
+    /// [`ExecError::Cancelled`] without touching backends, and the flag is
+    /// cleared so it can't poison the next batch.
     pub fn execute(&mut self, batch: &Batch) -> BatchResult {
         let verdicts = crate::guard::review_batch(&self.policy, batch);
         let mut result = BatchResult::new();
         for (action, verdict) in batch.0.iter().zip(verdicts) {
+            if self.cancel.load(Ordering::SeqCst) {
+                // One-shot: clear first so even a panic between here and
+                // the return can't leave the flag armed for a later batch.
+                self.cancel.store(false, Ordering::SeqCst);
+                let remaining = batch.0.len() - result.outcomes.len();
+                result.outcomes.extend(
+                    std::iter::repeat(ActionOutcome::Failed {
+                        error: ExecError::Cancelled(
+                            "batch cancelled: emergency stop requested".into(),
+                        ),
+                    })
+                    .take(remaining),
+                );
+                return result;
+            }
             let outcome = match verdict {
                 crate::guard::Verdict::Allow => {
                     let (outcome, new_frame) = self.execute_one(action);
@@ -802,6 +887,142 @@ mod tests {
         }]));
         assert!(r.all_ok());
         assert_eq!(ex.input().log.len(), 3); // move + press + release
+    }
+
+    #[test]
+    fn cancel_before_batch_drains_every_action_without_touching_backends() {
+        let mut ex = executor();
+        ex.cancel(); // armed before the batch
+        assert!(ex.cancel_armed());
+        let r = ex.execute(&Batch(vec![
+            Action::Screenshot { note: None },
+            Action::Wait { ms: 5 },
+            Action::Keypress {
+                keys: vec!["a".into()],
+            },
+        ]));
+        assert_eq!(r.outcomes.len(), 3);
+        for o in &r.outcomes {
+            match o {
+                ActionOutcome::Failed {
+                    error: ExecError::Cancelled(_),
+                } => {}
+                other => panic!("expected Cancelled, got {:?}", other),
+            }
+        }
+        assert!(!r.all_ok());
+        assert!(ex.input().log.is_empty());
+        assert!(ex.clock().sleeps().is_empty());
+        // One-shot: the flag clears itself so the next batch runs clean.
+        assert!(!ex.cancel_armed());
+        let r = ex.execute(&screenshot_batch());
+        assert!(r.all_ok());
+        assert_eq!(r.new_frames, vec![FrameId(1)]);
+    }
+
+    /// Input-backend wrapper that arms executor cancellation the first time
+    /// the pointer is pressed — simulates an external
+    /// `notifications/cancelled` arriving mid-batch. The handle is handed
+    /// over after the executor is built (shared slot), so the wrapper can
+    /// flip the *executor's own* flag.
+    struct CancellingInput {
+        inner: MockInput,
+        slot: std::sync::Arc<std::sync::Mutex<Option<CancelHandle>>>,
+        flipped: bool,
+    }
+
+    impl InputBackend for CancellingInput {
+        fn move_to(&mut self, p: UInputAbs) -> Result<(), ExecError> {
+            self.inner.move_to(p)
+        }
+        fn press(&mut self, b: MouseButton) -> Result<(), ExecError> {
+            if !self.flipped {
+                self.flipped = true;
+                if let Some(h) = self.slot.lock().unwrap().as_ref() {
+                    h.cancel();
+                }
+            }
+            self.inner.press(b)
+        }
+        fn release(&mut self, b: MouseButton) -> Result<(), ExecError> {
+            self.inner.release(b)
+        }
+        fn wheel(&mut self, dx: f64, dy: f64) -> Result<(), ExecError> {
+            self.inner.wheel(dx, dy)
+        }
+        fn keypress(&mut self, keys: &[String]) -> Result<(), ExecError> {
+            self.inner.keypress(keys)
+        }
+        fn type_text(&mut self, text: &str) -> Result<(), ExecError> {
+            self.inner.type_text(text)
+        }
+    }
+
+    #[test]
+    fn cancel_mid_batch_stops_at_the_next_action_boundary() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut ex = Executor::new(
+            MockCapture::new(identity_space()),
+            CancellingInput {
+                inner: MockInput::new(),
+                slot: slot.clone(),
+                flipped: false,
+            },
+            MockWindow::default(),
+            MockClock::new(),
+            Timing::default(),
+            DesktopGeometry::single(1920.0, 1080.0),
+        );
+        *slot.lock().unwrap() = Some(ex.cancel_handle());
+
+        let r = ex.execute(&Batch(vec![
+            Action::Screenshot { note: None },
+            Action::Click {
+                frame: FrameId(1),
+                button: MouseButton::Left,
+                x: 10,
+                y: 10,
+            },
+            Action::Wait { ms: 5 },
+            Action::Type {
+                text: "never typed".into(),
+            },
+        ]));
+        // Screenshot + click completed (the click's press armed the flag;
+        // cancellation takes effect at the *next* boundary, so the in-flight
+        // action runs to completion). Wait and Type drained as cancelled.
+        assert_eq!(r.new_frames, vec![FrameId(1)]);
+        assert!(matches!(r.outcomes[0], ActionOutcome::Done { .. }));
+        assert!(matches!(r.outcomes[1], ActionOutcome::Done { .. }));
+        for o in &r.outcomes[2..] {
+            assert!(
+                matches!(
+                    o,
+                    ActionOutcome::Failed {
+                        error: ExecError::Cancelled(_)
+                    }
+                ),
+                "expected Cancelled, got {:?}",
+                o
+            );
+        }
+        assert!(!ex.cancel_armed()); // one-shot: cleared
+        // The following batch runs normally.
+        let r = ex.execute(&Batch(vec![Action::Wait { ms: 5 }]));
+        assert!(r.all_ok());
+    }
+
+    #[test]
+    fn cancel_handle_clone_arms_the_same_flag() {
+        let ex = executor();
+        let h1 = ex.cancel_handle();
+        let h2 = h1.clone();
+        assert!(!h1.is_armed());
+        h2.cancel();
+        assert!(h1.is_armed());
+        assert!(ex.cancel_armed());
+        h1.clear();
+        assert!(!ex.cancel_armed());
     }
 
     #[test]

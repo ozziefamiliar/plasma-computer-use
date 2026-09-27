@@ -28,6 +28,11 @@ pub enum ExecError {
     /// Safety-guard denial or unconfirmed destructive action. Never retried;
     /// the reason is model-facing so the model can adjust.
     Guard(String),
+    /// Emergency cancellation: the cancel flag was armed (via
+    /// [`crate::Executor::cancel`], typically from an MCP
+    /// `notifications/cancelled`) before this action ran. Never retried;
+    /// remaining actions in the batch are drained as cancelled too.
+    Cancelled(String),
 }
 
 impl ExecError {
@@ -44,6 +49,7 @@ impl std::fmt::Display for ExecError {
             ExecError::Infra(e) => write!(f, "infrastructure failure: {}", e),
             ExecError::Backend(e) => write!(f, "backend failure: {}", e),
             ExecError::Guard(e) => write!(f, "safety guard: {}", e),
+            ExecError::Cancelled(e) => write!(f, "cancelled: {}", e),
         }
     }
 }
@@ -114,6 +120,16 @@ mod tests {
         assert!(!ExecError::Map(MapError::UnknownFrame(FrameId(1))).retryable());
         assert!(ExecError::Infra("pipewire dropped".into()).retryable());
         assert!(!ExecError::Backend("bad key name".into()).retryable());
+        assert!(!ExecError::Guard("denied".into()).retryable());
+        assert!(!ExecError::Cancelled("emergency stop".into()).retryable());
+    }
+
+    #[test]
+    fn cancelled_renders_model_readable() {
+        assert_eq!(
+            ExecError::Cancelled("emergency stop".into()).to_string(),
+            "cancelled: emergency stop"
+        );
     }
 
     #[test]

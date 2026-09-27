@@ -43,7 +43,7 @@ pub use backend::{
     WindowBackend, WindowInfo,
 };
 pub use coord::{DesktopPoint, MapError, PxPoint, UInputAbs, map_desktop_to_uinput, map_px_to_desktop};
-pub use executor::{Clock, Executor, MockClock, RealClock, Timing};
+pub use executor::{CancelHandle, Clock, Executor, MockClock, RealClock, Timing};
 pub use frame::{CoordSpace, DesktopGeometry, FrameId, FrameMeta, FrameRegistry, ScreenshotDesc};
 pub use guard::{Policy, Verdict, review, review_batch};
 pub use result::{ActionOutcome, BatchResult, ExecError};
