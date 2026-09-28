@@ -25,7 +25,9 @@
 pub mod kwin;
 pub mod spectacle;
 pub mod uinput;
+pub mod vwayland;
 
 pub use kwin::{DbusChannel, KWinWindows, QdbusChannel};
 pub use spectacle::{KScreenDoctor, SpectacleCapture};
 pub use uinput::UInputBackend;
+pub use vwayland::{VWaylandCapture, VWaylandInput, VWaylandWindow};

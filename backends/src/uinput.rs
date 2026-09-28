@@ -117,7 +117,7 @@ const KEY_L: u16 = 38;
 const KEY_SEMICOLON: u16 = 39;
 const KEY_APOSTROPHE: u16 = 40;
 const KEY_GRAVE: u16 = 41;
-const KEY_LEFTSHIFT: u16 = 42;
+pub(crate) const KEY_LEFTSHIFT: u16 = 42;
 const KEY_BACKSLASH: u16 = 43;
 const KEY_Z: u16 = 44;
 const KEY_X: u16 = 45;
@@ -129,7 +129,7 @@ const KEY_M: u16 = 50;
 const KEY_COMMA: u16 = 51;
 const KEY_DOT: u16 = 52;
 const KEY_SLASH: u16 = 53;
-const KEY_RIGHTSHIFT: u16 = 54;
+pub(crate) const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTALT: u16 = 56;
 const KEY_SPACE: u16 = 57;
 const KEY_F1: u16 = 59;
@@ -410,7 +410,7 @@ fn letter_key(c: char) -> Option<u16> {
 /// Resolve a `keypress` key name (case-insensitive) to an evdev key code.
 /// Returns `None` for unknown names — the caller turns that into a
 /// `Backend` error, never a silent no-op.
-fn key_code(name: &str) -> Option<u16> {
+pub(crate) fn key_code(name: &str) -> Option<u16> {
     let n = name.trim().to_ascii_uppercase();
     if n.len() == 1 {
         let c = n.chars().next().unwrap();
@@ -502,7 +502,7 @@ fn char_key(c: char) -> Option<u16> {
 /// Printable ASCII char → (key code, needs_shift), US layout. `None` means
 /// "not typeable through raw keycodes" — the caller must not silently drop
 /// it (see `type_text`).
-fn us_key(c: char) -> Option<(u16, bool)> {
+pub(crate) fn us_key(c: char) -> Option<(u16, bool)> {
     if c == ' ' {
         return Some((KEY_SPACE, false));
     }

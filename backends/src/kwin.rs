@@ -135,7 +135,7 @@ struct ScriptWindow {
 }
 
 /// FNV-1a 64: stable string→u64 for KWin's string window ids.
-fn fnv1a(s: &str) -> u64 {
+pub(crate) fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
